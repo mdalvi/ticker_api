@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "ticker-api"
+version = "0.1.15"
+description = ""
+authors = ["mdalvi <milind.dalvi@protonmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+redis = "^5.0.7"
+black = "^24.4.2"
+pytest = "^8.3.2"
+pyyaml = "^6.0.2"
+pytz = "^2024.1"
+pandas = "^2.2.2"
+zerodha-api = {path = "../zerodha_api"}
+sqlalchemy = "^2.0.32"
+pymysql = "^1.1.1"
+
+[tool.poetry.dev-dependencies]
+pytest = "^8.3.2"
+alembic = "^1.13.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

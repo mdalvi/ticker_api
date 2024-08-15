@@ -1,0 +1,12 @@
+# Configuration File
+
+# Local settings
+debug: "True"
+timezone: "Asia/Kolkata"
+
+# Database settings
+# Replace with your actual database credentials
+db_username: "username"
+db_password: "password"
+db_host: "host"
+db_schema_name: 'schema_name'
