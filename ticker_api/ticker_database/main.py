@@ -1,6 +1,12 @@
+from datetime import datetime
+from typing import Optional, Tuple
+
+import pandas as pd
 from redis import Redis
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, text, func
+from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy.orm import Session
 from zerodha_api import ZerodhaConnect
 
 from ticker_api.settings import (
@@ -8,6 +14,11 @@ from ticker_api.settings import (
 )
 from ticker_api.settings import get_logger
 from ticker_api.ticker_database.schema import Base
+from ticker_api.ticker_database.schema import (
+    HistoricalDataSyncDetails,
+    HistoricalData,
+    Instruments,
+)
 
 logger = get_logger()
 
@@ -89,6 +100,247 @@ class TickerDatabase:
             logger.error(
                 f"td:sync_instruments: error while syncing instruments data: {str(e)}"
             )
+
+    @staticmethod
+    def _get_sync_details(
+        session: Session, instrument_token: int, interval: str
+    ) -> Optional[HistoricalDataSyncDetails]:
+        return (
+            session.query(HistoricalDataSyncDetails)
+            .filter_by(instrument_token=instrument_token, interval=interval)
+            .first()
+        )
+
+    @staticmethod
+    def _get_instrument_details(
+        session: Session, instrument_token: int
+    ) -> Optional[Tuple[str, str, str]]:
+        """
+        Retrieve instrument details for a given instrument token.
+
+        :param session: SQLAlchemy session
+        :param instrument_token: The instrument token to fetch details for
+        :return: Tuple of (instrument_type, tradingsymbol, exchange) if found, None otherwise
+        """
+        instrument = (
+            session.query(Instruments)
+            .filter_by(instrument_token=instrument_token)
+            .first()
+        )
+        if instrument:
+            return (
+                instrument.instrument_type,
+                instrument.tradingsymbol,
+                instrument.exchange,
+            )
+        return None
+
+    @staticmethod
+    def _insert_or_update_historical_data(
+        session: Session,
+        df: pd.DataFrame,
+        interval: str,
+        tradingsymbol: str,
+        exchange: str,
+        continuous: bool,
+    ):
+        # Prepare the data
+        data = [
+            {
+                "instrument_token": row.instrument_token,
+                "tradingsymbol": tradingsymbol,
+                "exchange": exchange,
+                "record_datetime": row.record_datetime,
+                "record_date": row.record_datetime.date(),
+                "record_time": row.record_datetime.time(),
+                "interval": interval,
+                "open_price": row.open_price,
+                "high_price": row.high_price,
+                "low_price": row.low_price,
+                "close_price": row.close_price,
+                "volume": row.volume,
+                "oi": row.oi,
+                "continuous": int(continuous),
+                "status": 1,
+            }
+            for _, row in df.iterrows()
+        ]
+
+        # Perform a batch upsert
+        stmt = insert(HistoricalData).values(data)
+        stmt = stmt.on_duplicate_key_update(
+            open_price=stmt.inserted.open_price,
+            high_price=stmt.inserted.high_price,
+            low_price=stmt.inserted.low_price,
+            close_price=stmt.inserted.close_price,
+            volume=stmt.inserted.volume,
+            oi=stmt.inserted.oi,
+            continuous=stmt.inserted.continuous,
+            status=stmt.inserted.status,
+        )
+
+        session.execute(stmt)
+        session.flush()
+
+    @staticmethod
+    def _update_sync_details(
+        session: Session,
+        instrument_token: int,
+        tradingsymbol: str,
+        exchange: str,
+        interval: str,
+        min_date: datetime.date,
+        max_date: datetime.date,
+        fut_contract_type: str,
+    ):
+        stmt = insert(HistoricalDataSyncDetails).values(
+            instrument_token=instrument_token,
+            tradingsymbol=tradingsymbol,
+            exchange=exchange,
+            interval=interval,
+            fut_contract_type=fut_contract_type,
+            from_date=min_date,
+            to_date=max_date,
+            status=1,  # Assuming 1 means successfully synced
+        )
+
+        stmt = stmt.on_duplicate_key_update(
+            tradingsymbol=stmt.inserted.tradingsymbol,
+            exchange=stmt.inserted.exchange,
+            fut_contract_type=fut_contract_type,
+            from_date=stmt.inserted.from_date,
+            to_date=stmt.inserted.to_date,
+            status=stmt.inserted.status,
+        )
+
+        session.execute(stmt)
+        session.flush()
+
+    def sync_historical_data(
+        self,
+        instrument_token: int,
+        interval: str,
+        fut_contract_type: Optional[str] = None,
+    ):
+        """
+        Synchronize historical data for given instrument_token with database.
+
+        :param instrument_token: The instrument token to fetch data for
+        :param interval: The time interval for the data (e.g., 'day', '15minute'. '5minute').
+        :param fut_contract_type: Futures contract type identifier (current, mid, far) or None otherwise.
+        :return:
+        """
+        try:
+            logger.info(
+                f"td:sync_historical_data: starting sync for instrument_token {instrument_token} with interval {interval}"
+            )
+
+            # Connect to the specific database
+            engine = create_engine(
+                self.db_connection_string + self.db_schema_name, echo=False
+            )
+
+            with Session(engine) as session:
+                instrument_details = self._get_instrument_details(
+                    session, instrument_token
+                )
+                if not instrument_details:
+                    logger.error(
+                        f"td:sync_historical_data: instrument details not found for token {instrument_token}"
+                    )
+                    return
+
+                instrument_type, tradingsymbol, exchange = instrument_details
+                continuous = instrument_type != "EQ"
+
+                sync_details = self._get_sync_details(
+                    session, instrument_token, interval
+                )
+                if sync_details:
+                    from_date = sync_details.to_date
+                    to_date = datetime.now().date()
+                else:
+                    logger.info(
+                        f"td:sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from 2005-01-01."
+                    )
+                    from_date = datetime(2005, 1, 1).date()
+                    to_date = datetime.now().date()
+
+                historical_df = self.z_connect.historical_data(
+                    instrument_token=instrument_token,
+                    from_date=from_date.strftime("%Y-%m-%d"),
+                    to_date=to_date.strftime("%Y-%m-%d"),
+                    interval=interval,
+                    continuous=continuous,
+                    oi=True,
+                )
+
+                if not historical_df.empty:
+                    self._insert_or_update_historical_data(
+                        session,
+                        historical_df,
+                        interval,
+                        tradingsymbol,
+                        exchange,
+                        continuous,
+                    )
+                    logger.info(
+                        f"td:sync_historical_data: inserted/updated {len(historical_df)} records for instrument_token {instrument_token}"
+                    )
+
+                    min_max_dates = (
+                        session.query(
+                            func.min(HistoricalData.record_date).label("min_date"),
+                            func.max(HistoricalData.record_date).label("max_date"),
+                        )
+                        .filter_by(instrument_token=instrument_token, interval=interval)
+                        .first()
+                    )
+
+                    if (
+                        min_max_dates
+                        and min_max_dates.min_date
+                        and min_max_dates.max_date
+                    ):
+                        self._update_sync_details(
+                            session,
+                            instrument_token,
+                            tradingsymbol,
+                            exchange,
+                            interval,
+                            min_max_dates.min_date,
+                            min_max_dates.max_date,
+                            fut_contract_type,
+                        )
+                        logger.info(
+                            f"td:sync_historical_data: updated sync details for instrument_token {instrument_token}"
+                        )
+                    else:
+                        logger.warning(
+                            f"td:sync_historical_data: no data found for instrument_token {instrument_token}"
+                        )
+                else:
+                    logger.warning(
+                        f"td:sync_historical_data: no historical data retrieved for instrument_token {instrument_token}"
+                    )
+
+                session.commit()
+
+            logger.info(
+                f"td:sync_historical_data: sync for instrument_token {instrument_token} with interval {interval} completed"
+            )
+        except SQLAlchemyError as e:
+            logger.error(
+                f"td:sync_historical_data: sqlalchemy error syncing historical data for instrument_token {instrument_token}: {str(e)}"
+            )
+            if "session" in locals():
+                session.rollback()
+        except Exception as e:
+            logger.error(
+                f"td:sync_historical_data: unexpected error syncing historical data for instrument_token {instrument_token}: {str(e)}"
+            )
+            if "session" in locals():
+                session.rollback()
 
     def _create_database_if_not_exists(self):
         try:

@@ -18,6 +18,38 @@ Base = declarative_base()
 
 
 # =============================
+# Historical Updates Table
+# =============================
+class HistoricalDataSyncDetails(Base):
+    __tablename__ = "historical_data_sync_details"
+    __table_args__ = (
+        Index("idx_instrument_token", "instrument_token"),
+        Index("idx_exchange", "exchange"),
+        Index("idx_interval", "interval"),
+        Index("idx_fut_contract_type", "fut_contract_type"),
+        UniqueConstraint("instrument_token", "interval"),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    instrument_token = Column(Integer, nullable=False)
+    tradingsymbol = Column(String(255), nullable=False)
+    exchange = Column(String(10), nullable=False)
+    interval = Column(String(8), nullable=False)
+    fut_contract_type = Column(String(8), nullable=True)
+    from_date = Column(Date, nullable=False)
+    to_date = Column(Date, nullable=False)
+    status = Column(SmallInteger, nullable=False, server_default="1")
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.current_timestamp(),
+    )
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+# =============================
 # Historical Data Table
 # =============================
 class HistoricalData(Base):
@@ -33,8 +65,9 @@ class HistoricalData(Base):
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    tradingsymbol = Column(String(255), nullable=False)
     instrument_token = Column(Integer, nullable=False)
+    tradingsymbol = Column(String(255), nullable=False)
+    exchange = Column(String(10), nullable=False)
     record_datetime = Column(DateTime, nullable=False)
     record_date = Column(Date, nullable=False)
     record_time = Column(Time, nullable=False)
