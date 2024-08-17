@@ -43,6 +43,8 @@ class HistoricalData(Base):
     high_price = Column(Numeric(10, 2), nullable=False)
     low_price = Column(Numeric(10, 2), nullable=False)
     close_price = Column(Numeric(10, 2), nullable=False)
+    continuous = Column(SmallInteger, nullable=False)
+    oi = Column(BigInteger, nullable=False)
     volume = Column(BigInteger, nullable=False)
     status = Column(SmallInteger, nullable=False, server_default="1")
     updated_at = Column(
@@ -79,7 +81,7 @@ class Instruments(Base):
     instrument_type = Column(String(10), nullable=False)
     strike = Column(Numeric(10, 2), nullable=False)
     last_price = Column(Numeric(10, 2), nullable=False)
-    exchange_token = Column(Numeric(10, 2), nullable=False)
+    exchange_token = Column(Integer, nullable=False)
     expiry = Column(Date, nullable=True)
     tick_size = Column(Numeric(10, 2), nullable=False)
     status = Column(SmallInteger, nullable=False, server_default="1")
