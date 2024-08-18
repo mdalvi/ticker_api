@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -261,7 +261,7 @@ class TickerDatabase:
                     session, instrument_token, interval
                 )
                 if sync_details:
-                    from_date = sync_details.to_date
+                    from_date = sync_details.to_date - timedelta(days=5)
                     to_date = datetime.now().date()
                 else:
                     logger.info(
