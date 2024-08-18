@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, inspect, text, func
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func as sql_func
 from zerodha_api import ZerodhaConnect
 
 from ticker_api.settings import (
@@ -25,12 +26,12 @@ logger = get_logger()
 
 class TickerDatabase:
     def __init__(
-        self,
-        token: str,
-        redis_host: str = "127.0.0.1",
-        redis_password: str = "",
-        redis_port: int = 6379,
-        redis_db: int = 0,
+            self,
+            token: str,
+            redis_host: str = "127.0.0.1",
+            redis_password: str = "",
+            redis_port: int = 6379,
+            redis_db: int = 0,
     ):
         """
         A class that initializes and manages a KiteConnect connection and Redis client for market data processing.
@@ -103,7 +104,7 @@ class TickerDatabase:
 
     @staticmethod
     def _get_sync_details(
-        session: Session, instrument_token: int, interval: str
+            session: Session, instrument_token: int, interval: str
     ) -> Optional[HistoricalDataSyncDetails]:
         return (
             session.query(HistoricalDataSyncDetails)
@@ -113,7 +114,7 @@ class TickerDatabase:
 
     @staticmethod
     def _get_instrument_details(
-        session: Session, instrument_token: int
+            session: Session, instrument_token: int
     ) -> Optional[Tuple[str, str, str]]:
         """
         Retrieve instrument details for a given instrument token.
@@ -137,12 +138,12 @@ class TickerDatabase:
 
     @staticmethod
     def _insert_or_update_historical_data(
-        session: Session,
-        df: pd.DataFrame,
-        interval: str,
-        tradingsymbol: str,
-        exchange: str,
-        continuous: bool,
+            session: Session,
+            df: pd.DataFrame,
+            interval: str,
+            tradingsymbol: str,
+            exchange: str,
+            continuous: bool,
     ):
         # Prepare the data
         data = [
@@ -177,6 +178,7 @@ class TickerDatabase:
             oi=stmt.inserted.oi,
             continuous=stmt.inserted.continuous,
             status=stmt.inserted.status,
+            updated_at=sql_func.now(),  # Set the current timestamp
         )
 
         session.execute(stmt)
@@ -184,14 +186,14 @@ class TickerDatabase:
 
     @staticmethod
     def _update_sync_details(
-        session: Session,
-        instrument_token: int,
-        tradingsymbol: str,
-        exchange: str,
-        interval: str,
-        min_date: datetime.date,
-        max_date: datetime.date,
-        fut_contract_type: str,
+            session: Session,
+            instrument_token: int,
+            tradingsymbol: str,
+            exchange: str,
+            interval: str,
+            min_date: datetime.date,
+            max_date: datetime.date,
+            fut_contract_type: str,
     ):
         stmt = insert(HistoricalDataSyncDetails).values(
             instrument_token=instrument_token,
@@ -202,6 +204,7 @@ class TickerDatabase:
             from_date=min_date,
             to_date=max_date,
             status=1,  # Assuming 1 means successfully synced
+            updated_at=sql_func.now(),  # Set the current timestamp
         )
 
         stmt = stmt.on_duplicate_key_update(
@@ -211,16 +214,17 @@ class TickerDatabase:
             from_date=stmt.inserted.from_date,
             to_date=stmt.inserted.to_date,
             status=stmt.inserted.status,
+            updated_at=sql_func.now(),  # Set the current timestamp
         )
 
         session.execute(stmt)
         session.flush()
 
     def sync_historical_data(
-        self,
-        instrument_token: int,
-        interval: str,
-        fut_contract_type: Optional[str] = None,
+            self,
+            instrument_token: int,
+            interval: str,
+            fut_contract_type: Optional[str] = None,
     ):
         """
         Synchronize historical data for given instrument_token with database.
@@ -232,7 +236,7 @@ class TickerDatabase:
         """
         try:
             logger.info(
-                f"td:sync_historical_data: starting sync for instrument_token {instrument_token} with interval {interval}"
+                f"td:sync_historical_data: starting sync for instrument_token {instrument_token} with interval '{interval}'"
             )
 
             # Connect to the specific database
@@ -261,9 +265,9 @@ class TickerDatabase:
                     to_date = datetime.now().date()
                 else:
                     logger.info(
-                        f"td:sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from 2005-01-01."
+                        f"td:sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from '2009-03-01'"
                     )
-                    from_date = datetime(2005, 1, 1).date()
+                    from_date = datetime(2009, 3, 1).date()  # `INDIA VIX` is available from here onwards
                     to_date = datetime.now().date()
 
                 historical_df = self.z_connect.historical_data(
@@ -298,9 +302,9 @@ class TickerDatabase:
                     )
 
                     if (
-                        min_max_dates
-                        and min_max_dates.min_date
-                        and min_max_dates.max_date
+                            min_max_dates
+                            and min_max_dates.min_date
+                            and min_max_dates.max_date
                     ):
                         self._update_sync_details(
                             session,
@@ -327,7 +331,7 @@ class TickerDatabase:
                 session.commit()
 
             logger.info(
-                f"td:sync_historical_data: sync for instrument_token {instrument_token} with interval {interval} completed"
+                f"td:sync_historical_data: sync for instrument_token {instrument_token} with interval '{interval}' completed."
             )
         except SQLAlchemyError as e:
             logger.error(
@@ -341,6 +345,73 @@ class TickerDatabase:
             )
             if "session" in locals():
                 session.rollback()
+
+    def sync_historical_data_all(self):
+        """
+        Synchronize historical data for all instruments and intervals in the historical_data_sync_details table.
+
+        :return:
+        """
+        logger.info(
+            "td:sync_historical_data_all: starting synchronization for all historical data"
+        )
+
+        try:
+            # Connect to the specific database
+            engine = create_engine(
+                self.db_connection_string + self.db_schema_name, echo=False
+            )
+
+            with Session(engine) as session:
+                # Step 1: Select all tuples from historical_data_sync_details
+                sync_details = session.query(
+                    HistoricalDataSyncDetails.instrument_token,
+                    HistoricalDataSyncDetails.interval,
+                    HistoricalDataSyncDetails.fut_contract_type,
+                ).all()
+
+                total_instruments = len(sync_details)
+                logger.info(
+                    f"td:sync_historical_data_all: found {total_instruments} instruments to synchronize"
+                )
+
+                # Step 2: Iterate through the tuples and call sync_historical_data
+                for i, (instrument_token, interval, fut_contract_type) in enumerate(
+                        sync_details, 1
+                ):
+                    try:
+                        logger.info(
+                            f"td:sync_historical_data_all: syncing instrument {i}/{total_instruments} - "
+                            f"token: {instrument_token}, interval: {interval}, "
+                            f"future contract type: {fut_contract_type or 'N/A'}"
+                        )
+
+                        self.sync_historical_data(
+                            instrument_token=instrument_token,
+                            interval=interval,
+                            fut_contract_type=fut_contract_type,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"td:sync_historical_data_all: error syncing data for instrument {instrument_token}, "
+                            f"interval {interval}: {str(e)}"
+                        )
+
+                logger.info(
+                    "td:sync_historical_data_all: completed synchronization for all historical data"
+                )
+
+        except SQLAlchemyError as e:
+            logger.error(
+                f"td:sync_historical_data_all: sqlalchemy error during synchronization: {str(e)}"
+            )
+        except Exception as e:
+            logger.error(
+                f"td:sync_historical_data_all: unexpected error during synchronization: {str(e)}"
+            )
+        logger.info(
+            "td:sync_historical_data_all: finished historical data synchronization process"
+        )
 
     def _create_database_if_not_exists(self):
         try:

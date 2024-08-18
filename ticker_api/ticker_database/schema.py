@@ -61,7 +61,7 @@ class HistoricalData(Base):
         Index("idx_record_date", "record_date"),
         Index("idx_record_time", "record_time"),
         UniqueConstraint("instrument_token", "record_datetime", "interval"),
-        {"mysql_engine": "MyISAM"},
+        {"mysql_engine": "InnoDB"},
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
