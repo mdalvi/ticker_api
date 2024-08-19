@@ -26,12 +26,12 @@ logger = get_logger()
 
 class TickerDatabase:
     def __init__(
-            self,
-            token: str,
-            redis_host: str = "127.0.0.1",
-            redis_password: str = "",
-            redis_port: int = 6379,
-            redis_db: int = 0,
+        self,
+        token: str,
+        redis_host: str = "127.0.0.1",
+        redis_password: str = "",
+        redis_port: int = 6379,
+        redis_db: int = 0,
     ):
         """
         A class that initializes and manages a KiteConnect connection and Redis client for market data processing.
@@ -104,7 +104,7 @@ class TickerDatabase:
 
     @staticmethod
     def _get_sync_details(
-            session: Session, instrument_token: int, interval: str
+        session: Session, instrument_token: int, interval: str
     ) -> Optional[HistoricalDataSyncDetails]:
         return (
             session.query(HistoricalDataSyncDetails)
@@ -114,7 +114,7 @@ class TickerDatabase:
 
     @staticmethod
     def _get_instrument_details(
-            session: Session, instrument_token: int
+        session: Session, instrument_token: int
     ) -> Optional[Tuple[str, str, str]]:
         """
         Retrieve instrument details for a given instrument token.
@@ -138,12 +138,12 @@ class TickerDatabase:
 
     @staticmethod
     def _insert_or_update_historical_data(
-            session: Session,
-            df: pd.DataFrame,
-            interval: str,
-            tradingsymbol: str,
-            exchange: str,
-            continuous: bool,
+        session: Session,
+        df: pd.DataFrame,
+        interval: str,
+        tradingsymbol: str,
+        exchange: str,
+        continuous: bool,
     ):
         # Prepare the data
         data = [
@@ -186,14 +186,14 @@ class TickerDatabase:
 
     @staticmethod
     def _update_sync_details(
-            session: Session,
-            instrument_token: int,
-            tradingsymbol: str,
-            exchange: str,
-            interval: str,
-            min_date: datetime.date,
-            max_date: datetime.date,
-            fut_contract_type: str,
+        session: Session,
+        instrument_token: int,
+        tradingsymbol: str,
+        exchange: str,
+        interval: str,
+        min_date: datetime.date,
+        max_date: datetime.date,
+        fut_contract_type: str,
     ):
         stmt = insert(HistoricalDataSyncDetails).values(
             instrument_token=instrument_token,
@@ -221,10 +221,10 @@ class TickerDatabase:
         session.flush()
 
     def sync_historical_data(
-            self,
-            instrument_token: int,
-            interval: str,
-            fut_contract_type: Optional[str] = None,
+        self,
+        instrument_token: int,
+        interval: str,
+        fut_contract_type: Optional[str] = None,
     ):
         """
         Synchronize historical data for given instrument_token with database.
@@ -267,7 +267,9 @@ class TickerDatabase:
                     logger.info(
                         f"td:sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from '2009-03-01'"
                     )
-                    from_date = datetime(2009, 3, 1).date()  # `INDIA VIX` is available from here onwards
+                    from_date = datetime(
+                        2009, 3, 1
+                    ).date()  # `INDIA VIX` is available from here onwards
                     to_date = datetime.now().date()
 
                 historical_df = self.z_connect.historical_data(
@@ -302,9 +304,9 @@ class TickerDatabase:
                     )
 
                     if (
-                            min_max_dates
-                            and min_max_dates.min_date
-                            and min_max_dates.max_date
+                        min_max_dates
+                        and min_max_dates.min_date
+                        and min_max_dates.max_date
                     ):
                         self._update_sync_details(
                             session,
@@ -377,7 +379,7 @@ class TickerDatabase:
 
                 # Step 2: Iterate through the tuples and call sync_historical_data
                 for i, (instrument_token, interval, fut_contract_type) in enumerate(
-                        sync_details, 1
+                    sync_details, 1
                 ):
                     try:
                         logger.info(

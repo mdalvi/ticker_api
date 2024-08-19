@@ -22,3 +22,12 @@ class InvalidExchangeException(TickerTapeException):
 
     def __init__(self, message: str | None = None):
         super().__init__(message)
+
+
+class InvalidSegmentException(TickerTapeException):
+    """
+    Occurs when segment is not supported for operations by TickerClass
+    """
+
+    def __init__(self, message: str | None = None):
+        super().__init__(message)
