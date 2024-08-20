@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 import pandas as pd
-from redis import Redis
 from sqlalchemy import create_engine, inspect, text, func
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
@@ -34,7 +33,7 @@ class TickerDatabase:
         redis_db: int = 0,
     ):
         """
-        A class that initializes and manages a KiteConnect connection and Redis client for market data processing.
+        Provides high level methods to house keep market data using Zerodha API in MySQL database.
 
         :param token: Encrypted access token required for the Zerodha API.
         :param redis_host: The Redis server hostname or IP address. Defaults to "127.0.0.1".
@@ -57,16 +56,9 @@ class TickerDatabase:
             self.db_connection_string,
             echo=False,
         )
-
-        self.z_connect = ZerodhaConnect(token=token)
-        redis_config = {
-            "host": redis_host,
-            "password": redis_password,
-            "port": redis_port,
-            "db": redis_db,
-            "decode_responses": True,
-        }
-        self.redis_client = Redis(**redis_config)
+        self.z_connect = ZerodhaConnect(
+            token, redis_host, redis_password, redis_port, redis_db
+        )
 
     def sync_instruments(self):
         """

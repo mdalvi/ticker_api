@@ -8,11 +8,9 @@ from typing import Optional, Dict, Any
 import pandas as pd
 import pytz
 from dateutil.relativedelta import relativedelta, TH, WE, FR, MO
-from redis import Redis
 from sqlalchemy import select, create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker, Session
-from zerodha_api import ZerodhaConnect
 
 from ticker_api.exceptions import InvalidExchangeException, InvalidSegmentException
 from ticker_api.settings import get_configuration, get_logger
@@ -37,22 +35,9 @@ class TickerTape:
     MAPPING_FO_SYMBOLS_TO_INDICES = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
     MAPPING_EQUITY_TO_FO_EXCHANGE = {"NSE": "NFO", "BSE": "BFO"}
 
-    def __init__(
-        self,
-        token: str,
-        redis_host: str = "127.0.0.1",
-        redis_password: str = "",
-        redis_port: int = 6379,
-        redis_db: int = 0,
-    ):
+    def __init__(self):
         """
-        A class that initializes and manages a KiteConnect connection and Redis client for market data processing.
-
-        :param token: Encrypted access token required for the Zerodha API.
-        :param redis_host: The Redis server hostname or IP address. Defaults to "127.0.0.1".
-        :param redis_password: The Redis server password. Defaults to an empty string.
-        :param redis_port: The Redis server port. Defaults to 6379.
-        :param redis_db: The Redis database number to connect to. Defaults to 0.
+        Provides high level methods to interact with market data stored in MySQL database.
         """
         self.config = get_configuration()
 
@@ -68,16 +53,6 @@ class TickerTape:
             echo=False,
         )
         self.Session = sessionmaker(bind=self.engine)
-
-        self.z_connect = ZerodhaConnect(token=token)
-        redis_config = {
-            "host": redis_host,
-            "password": redis_password,
-            "port": redis_port,
-            "db": redis_db,
-            "decode_responses": True,
-        }
-        self.redis_client = Redis(**redis_config)
 
     @staticmethod
     def _extract_spot_name(tradingsymbol: str) -> str:
