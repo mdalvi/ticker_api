@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ticker-api"
-version = "0.1.47"
+version = "0.1.53"
 description = ""
 authors = ["mdalvi <milind.dalvi@protonmail.com>"]
 license = "MIT"

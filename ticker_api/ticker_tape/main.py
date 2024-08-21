@@ -383,44 +383,81 @@ class TickerTape:
     def _get_index_data(
         self, session: Session, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
-        logger.info(
-            f"tt:_get_index_data: querying for index data of {tradingsymbol}@{exchange} with interval {interval}"
+        mapped_symbol, expiry_day = self.MAPPING_INDICES_TO_FO_SYMBOLS.get(
+            (tradingsymbol, exchange), (tradingsymbol, "Thursday")
         )
-        instrument = session.execute(
-            select(Instruments).where(
-                (Instruments.tradingsymbol == tradingsymbol)
-                & (Instruments.exchange == exchange)
-            )
-        ).scalar_one_or_none()
+        future_symbols = self._get_next_three_active_contracts(
+            spot_name=self._extract_spot_name(mapped_symbol),
+            expiry_day=expiry_day,
+            timezone=self.config["timezone"],
+        )[:2]
 
-        if not instrument:
+        dfs = []
+        for i, future_symbol in enumerate(future_symbols):
+            mapped_exchange = self.MAPPING_EQUITY_TO_FO_EXCHANGE.get(exchange, exchange)
+            future_instrument = session.execute(
+                select(Instruments).where(
+                    (Instruments.tradingsymbol == future_symbol)
+                    & (Instruments.exchange == mapped_exchange)
+                )
+            ).scalar_one_or_none()
+
+            if future_instrument:
+                logger.info(
+                    f"tt:_get_futures_data: querying for index futures data of {future_symbol}@{mapped_exchange} with interval {interval}"
+                )
+                df = self._get_historical_data(
+                    session, future_instrument.instrument_token, interval
+                )
+
+                if df.empty:
+                    continue
+
+                if i == 0:
+                    df = df[
+                        [
+                            "open_price",
+                            "high_price",
+                            "low_price",
+                            "close_price",
+                            "volume",
+                            "oi",
+                        ]
+                    ]
+                else:
+                    df = df[["oi"]].rename(columns={"oi": "oi_next"})
+                dfs.append(df)
+
+        if not dfs:
             logger.warning(
-                f"tt:_get_index_data: index instrument not found for {tradingsymbol} on {exchange}"
+                f"tt:_get_futures_data: no index futures data found for {tradingsymbol} on {exchange}"
             )
             return pd.DataFrame()
 
-        df = self._get_historical_data(session, instrument.instrument_token, interval)
+        combined_df = pd.concat(dfs, axis=1)
 
-        if df.empty:
-            return df
+        # Ensure index is unique
+        if combined_df.index.duplicated().any():
+            logger.warning(
+                "tt:_get_futures_data: duplicate index values found. keeping last occurrence."
+            )
+            combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
 
-        # Rename and select only INDEX-related columns
-        index_columns = {
+        # Sum the oi columns
+        oi_columns = combined_df.filter(like="oi").columns
+        combined_df["oi"] = combined_df[oi_columns].sum(axis=1)
+
+        # Rename columns with 'fut_' prefix and select only relevant columns
+        fut_columns = {
             "open_price": "index_open",
             "high_price": "index_high",
             "low_price": "index_low",
             "close_price": "index_close",
+            "volume": "index_volume",
+            "oi": "index_oi",
         }
-        df = df.rename(columns=index_columns)[list(index_columns.values())]
-
-        # Ensure index is unique
-        if df.index.duplicated().any():
-            logger.warning(
-                "tt:_get_index_data: duplicate index values found. keeping last occurrence."
-            )
-            df = df[~df.index.duplicated(keep="last")]
-
-        return df
+        renamed_df = combined_df.rename(columns=fut_columns)[list(fut_columns.values())]
+        return renamed_df
 
     def _get_futures_data(
         self, session: Session, tradingsymbol: str, exchange: str, interval: str
@@ -490,15 +527,15 @@ class TickerTape:
         combined_df["oi"] = combined_df[oi_columns].sum(axis=1)
 
         # Rename columns with 'fut_' prefix and select only relevant columns
-        fut_columns = [
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "volume",
-            "oi",
-        ]
-        renamed_df = combined_df[fut_columns].rename(columns=lambda x: f"fut_{x}")
+        fut_columns = {
+            "open_price": "fut_open",
+            "high_price": "fut_high",
+            "low_price": "fut_low",
+            "close_price": "fut_close",
+            "volume": "fut_volume",
+            "oi": "fut_oi",
+        }
+        renamed_df = combined_df.rename(columns=fut_columns)[list(fut_columns.values())]
         return renamed_df
 
     def _get_equity_data(
