@@ -606,8 +606,12 @@ class TickerTape:
                         fut_data_df = self._get_futures_data(
                             session, tradingsymbol, exchange, interval
                         )
+                        eq_data_df = self._get_equity_data(
+                            session, tradingsymbol, exchange, interval
+                        )
                         return pd.concat(
-                            [index_fut_data_df, fut_data_df, vix_data_df], axis=1
+                            [eq_data_df, index_fut_data_df, fut_data_df, vix_data_df],
+                            axis=1,
                         )
                 elif category == "FUTURES":
                     if exchange not in ["NFO"]:
