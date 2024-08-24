@@ -380,7 +380,7 @@ class TickerTape:
 
         return df
 
-    def _get_index_data(
+    def _get_index_fut_data(
         self, session: Session, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
         mapped_symbol, expiry_day = self.MAPPING_INDICES_TO_FO_SYMBOLS.get(
@@ -594,31 +594,37 @@ class TickerTape:
                     if tradingsymbol == "INDIA VIX":
                         return vix_data_df
                     else:
-                        index_data_df = self._get_index_data(
-                            session, tradingsymbol, exchange, interval
+                        index_tradingsymbol = "NIFTY 50"
+                        index_tradingsymbol = (
+                            "NIFTY BANK"
+                            if tradingsymbol == "NIFTY 50"
+                            else index_tradingsymbol
+                        )
+                        index_fut_data_df = self._get_index_fut_data(
+                            session, index_tradingsymbol, exchange, interval
                         )
                         fut_data_df = self._get_futures_data(
                             session, tradingsymbol, exchange, interval
                         )
                         return pd.concat(
-                            [index_data_df, fut_data_df, vix_data_df], axis=1
+                            [index_fut_data_df, fut_data_df, vix_data_df], axis=1
                         )
                 elif category == "FUTURES":
-                    if exchange not in ["NFO", "BFO"]:
+                    if exchange not in ["NFO"]:
                         raise InvalidExchangeException(
-                            f"tt:_get_data_for_x_by_symbol: exchange {exchange} is not supported; only NFO and BFO are allowed."
+                            f"tt:_get_data_for_x_by_symbol: exchange {exchange} is not supported; only NFO are allowed."
                         )
 
-                    index_tradingsymbol = "NIFTY 50" if exchange == "NFO" else "SENSEX"
-                    index_exchange = "NSE" if exchange == "NFO" else "BSE"
-                    index_data_df = self._get_index_data(
+                    index_tradingsymbol = "NIFTY 50"
+                    index_exchange = "NSE"
+                    index_fut_data_df = self._get_index_fut_data(
                         session, index_tradingsymbol, index_exchange, interval
                     )
                     fut_data_df = self._get_futures_data(
                         session, tradingsymbol, exchange, interval
                     )
 
-                    equity_exchange = "NSE" if exchange == "NFO" else "BSE"
+                    equity_exchange = "NSE"
                     equity_tradingsymbol = self.MAPPING_FO_SYMBOLS_TO_INDICES.get(
                         self._extract_spot_name(tradingsymbol), tradingsymbol
                     )
@@ -627,16 +633,17 @@ class TickerTape:
                         session, equity_tradingsymbol, equity_exchange, interval
                     )
                     return pd.concat(
-                        [eq_data_df, index_data_df, fut_data_df, vix_data_df], axis=1
+                        [eq_data_df, index_fut_data_df, fut_data_df, vix_data_df],
+                        axis=1,
                     )
                 elif category == "EQUITY":
-                    if exchange not in ["NSE", "BSE"]:
+                    if exchange not in ["NSE"]:
                         raise InvalidExchangeException(
-                            f"tt:_get_data_for_x_by_symbol: exchange {exchange} is not supported; only NSE and BSE are allowed."
+                            f"tt:_get_data_for_x_by_symbol: exchange {exchange} is not supported; only NSE are allowed."
                         )
 
-                    index_tradingsymbol = "NIFTY 50" if exchange == "NSE" else "SENSEX"
-                    index_data_df = self._get_index_data(
+                    index_tradingsymbol = "NIFTY 50"
+                    index_fut_data_df = self._get_index_fut_data(
                         session, index_tradingsymbol, exchange, interval
                     )
                     fut_data_df = self._get_futures_data(
@@ -646,7 +653,8 @@ class TickerTape:
                         session, tradingsymbol, exchange, interval
                     )
                     return pd.concat(
-                        [eq_data_df, index_data_df, fut_data_df, vix_data_df], axis=1
+                        [eq_data_df, index_fut_data_df, fut_data_df, vix_data_df],
+                        axis=1,
                     )
 
                 else:
