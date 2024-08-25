@@ -24,9 +24,9 @@ class InvalidExchangeException(TickerTapeException):
         super().__init__(message)
 
 
-class InvalidSegmentException(TickerTapeException):
+class InvalidInstrumentCategoryException(TickerTapeException):
     """
-    Occurs when segment is not supported for operations by TickerClass
+    Occurs when given category of instrument is not suitable for retrieving data for X
     """
 
     def __init__(self, message: str | None = None):
