@@ -5,13 +5,14 @@ from datetime import datetime, date, time
 from decimal import Decimal
 from typing import Optional, Dict, Any
 
+import numpy as np
 import pandas as pd
 import pytz
 from dateutil.relativedelta import relativedelta, TH, WE, FR, MO
 from sqlalchemy import select, create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker, Session
-import numpy as np
+
 from ticker_api.exceptions import (
     InvalidExchangeException,
     InvalidInstrumentCategoryException,
@@ -101,7 +102,7 @@ class TickerTape:
         return last_day + relativedelta(weekday=expiry_weekday(-1))
 
     def _get_next_three_active_contracts(
-        self, spot_name: str, expiry_day: str, timezone: str
+            self, spot_name: str, expiry_day: str, timezone: str
     ) -> list:
         """
         Generate the names of the next three active futures contracts.
@@ -180,11 +181,11 @@ class TickerTape:
         return days_to_expiry
 
     def _get_details_by_symbol(
-        self,
-        tradingsymbol: str,
-        exchange: str,
-        return_db_details: bool,
-        fetch_futures: bool,
+            self,
+            tradingsymbol: str,
+            exchange: str,
+            return_db_details: bool,
+            fetch_futures: bool,
     ) -> Dict[str, Any]:
         """
         Retrieves instrument details from the database based on the trading symbol and exchange.
@@ -250,7 +251,7 @@ class TickerTape:
             return {}  # Return an empty dict in case of any exception
 
     def _get_details_by_token(
-        self, instrument_token: int, return_db_details: bool
+            self, instrument_token: int, return_db_details: bool
     ) -> Dict[str, Any]:
         """
         Retrieves instrument details from the database based on the instrument token.
@@ -291,11 +292,11 @@ class TickerTape:
             return {}  # Return an empty dict in case of any exception
 
     def get_details(
-        self,
-        tradingsymbol: Optional[str] = None,
-        exchange: Optional[str] = None,
-        instrument_token: Optional[int] = None,
-        return_db_details: bool = False,
+            self,
+            tradingsymbol: Optional[str] = None,
+            exchange: Optional[str] = None,
+            instrument_token: Optional[int] = None,
+            return_db_details: bool = False,
     ) -> Dict[str, Any]:
         """
         Get details of an instrument from the database based on either (tradingsymbol and exchange) or (instrument token).
@@ -345,7 +346,7 @@ class TickerTape:
 
     @staticmethod
     def _get_historical_data(
-        session: Session, instrument_token: int, interval: str
+            session: Session, instrument_token: int, interval: str
     ) -> pd.DataFrame:
         query = select(
             HistoricalData.instrument_token,
@@ -441,11 +442,11 @@ class TickerTape:
         return df
 
     def _get_futures_data(
-        self,
-        session: Session,
-        tradingsymbol: str,
-        exchange: str,
-        interval: str,
+            self,
+            session: Session,
+            tradingsymbol: str,
+            exchange: str,
+            interval: str,
     ) -> pd.DataFrame:
         mapped_symbol, expiry_day = self.MAPPING_INDICES_TO_FO_SYMBOLS.get(
             (tradingsymbol, exchange), (tradingsymbol, "Thursday")
@@ -454,7 +455,7 @@ class TickerTape:
             spot_name=self._extract_spot_name(mapped_symbol),
             expiry_day=expiry_day,
             timezone=self.config["timezone"],
-        )[:2]
+        )
 
         dfs = []
         for i, future_symbol in enumerate(future_symbols):
@@ -488,8 +489,14 @@ class TickerTape:
                             "oi",
                         ]
                     ]
-                else:
-                    df = df[["oi"]].rename(columns={"oi": "oi_next"})
+                elif i == 1:
+                    df = df[["close_price", "oi"]].rename(
+                        columns={"oi": "oi_mid", "close_price": "close_price_mid"}
+                    )
+                elif i == 2:
+                    df = df[["close_price"]].rename(
+                        columns={"close_price": "close_price_far"}
+                    )
                 dfs.append(df)
 
         if not dfs:
@@ -519,6 +526,8 @@ class TickerTape:
             "close_price": "fut_close",
             "volume": "fut_volume",
             "oi": "fut_oi",
+            "close_price_mid": "fut_close_mid",
+            "close_price_far": "fut_close_far",
         }
         renamed_df = combined_df.rename(columns=fut_columns)[list(fut_columns.values())]
         renamed_df["fut_dte"] = renamed_df.index.map(
@@ -527,7 +536,7 @@ class TickerTape:
         return renamed_df
 
     def _get_spot_data(
-        self, session: Session, tradingsymbol: str, exchange: str, interval: str
+            self, session: Session, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
         logger.info(
             f"tt:_get_spot_data: querying for equity data of {tradingsymbol}@{exchange} with interval {interval}"
@@ -574,14 +583,14 @@ class TickerTape:
         # Calculate the ratio between futures and spot prices
         df["fut_price_ratio"] = df["fut_close"] / df["spot_close"]
 
-        def estimate_split_ratio(ratio):
+        def estimate_split_ratio(ratio: float) -> float:
             if ratio > 1.5:
                 # Consider split ratios from 2 to 100
                 possible_splits = np.arange(2, 101)
                 # Find the split ratio that minimizes the difference
                 best_split = min(possible_splits, key=lambda x: abs(ratio - x))
-                return best_split
-            return 1
+                return best_split * 1.0
+            return 1.0
 
         # Apply the split ratio estimation
         df["fut_estimated_split"] = df["fut_price_ratio"].apply(estimate_split_ratio)
@@ -598,7 +607,7 @@ class TickerTape:
         return df
 
     def _get_data_for_x_by_symbol(
-        self, tradingsymbol: str, exchange: str, interval: str
+            self, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
         try:
             with self._session_scope() as session:
@@ -606,6 +615,12 @@ class TickerTape:
 
                 spot_data_df = self._get_spot_data(
                     session, tradingsymbol, exchange, interval
+                )
+                index_spot_df = self._get_spot_data(
+                    session, "NIFTY 50", "NSE", interval
+                )
+                index_spot_df.columns = index_spot_df.columns.str.replace(
+                    "^spot_", "index_spot_", regex=True
                 )
                 fut_data_df = self._get_futures_data(
                     session,
@@ -616,7 +631,7 @@ class TickerTape:
                 index_fut_data_df = self._get_futures_data(
                     session,
                     "NIFTY 50",
-                    exchange,
+                    "NSE",
                     interval,
                 )
                 index_fut_data_df.columns = index_fut_data_df.columns.str.replace(
@@ -624,8 +639,15 @@ class TickerTape:
                 )
                 vix_data_df = self._get_vix_data(session, interval)
                 complete_df = pd.concat(
-                    [spot_data_df, fut_data_df, index_fut_data_df, vix_data_df],
+                    [
+                        spot_data_df,
+                        index_spot_df,
+                        fut_data_df,
+                        index_fut_data_df,
+                        vix_data_df,
+                    ],
                     axis=1,
+                    verify_integrity=True,
                 )
                 complete_df = self._adjust_data_for_splits(complete_df)
                 return complete_df
@@ -637,7 +659,7 @@ class TickerTape:
             return pd.DataFrame()
 
     def _get_data_for_x_by_token(
-        self, instrument_token: int, interval: str
+            self, instrument_token: int, interval: str
     ) -> pd.DataFrame:
         try:
             with self._session_scope() as session:
@@ -669,11 +691,11 @@ class TickerTape:
             )  # Return an empty pd.DataFrame in case of any exception
 
     def get_data_for_x(
-        self,
-        tradingsymbol: Optional[str] = None,
-        exchange: Optional[str] = None,
-        instrument_token: Optional[int] = None,
-        interval: str = "day",
+            self,
+            tradingsymbol: Optional[str] = None,
+            exchange: Optional[str] = None,
+            instrument_token: Optional[int] = None,
+            interval: str = "day",
     ) -> pd.DataFrame:
         """
         Returns combined pd.DataFrame of equity and/or indices, with futures and vix with date index
@@ -697,20 +719,6 @@ class TickerTape:
                 raise ValueError(
                     "tt:get_data_for_x: invalid parameters! provide either (tradingsymbol, exchange) or instrument_token"
                 )
-
-            # Create full date range
-            start_date = pd.Timestamp("2009-03-01")
-            end_date = pd.Timestamp.now()
-            if interval == "day":
-                full_range = pd.date_range(start=start_date, end=end_date, freq="D")
-            else:
-                full_range = pd.date_range(
-                    start=start_date, end=end_date, freq=interval
-                )
-
-            # Reindex the dataframe with the full date range
-            df = df.reindex(full_range)
-            df.dropna(how="all", inplace=True)
             return df
         except Exception as e:
             logger.error(f"tt:get_data_for_x: an error occurred: {str(e)}")
