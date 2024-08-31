@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, time
 from decimal import Decimal
 from typing import Optional, Dict, Any
-
+import math
 import numpy as np
 import pandas as pd
 import pytz
@@ -102,7 +102,7 @@ class TickerTape:
         return last_day + relativedelta(weekday=expiry_weekday(-1))
 
     def _get_next_three_active_contracts(
-            self, spot_name: str, expiry_day: str, timezone: str
+        self, spot_name: str, expiry_day: str, timezone: str
     ) -> list:
         """
         Generate the names of the next three active futures contracts.
@@ -181,11 +181,11 @@ class TickerTape:
         return days_to_expiry
 
     def _get_details_by_symbol(
-            self,
-            tradingsymbol: str,
-            exchange: str,
-            return_db_details: bool,
-            fetch_futures: bool,
+        self,
+        tradingsymbol: str,
+        exchange: str,
+        return_db_details: bool,
+        fetch_futures: bool,
     ) -> Dict[str, Any]:
         """
         Retrieves instrument details from the database based on the trading symbol and exchange.
@@ -251,7 +251,7 @@ class TickerTape:
             return {}  # Return an empty dict in case of any exception
 
     def _get_details_by_token(
-            self, instrument_token: int, return_db_details: bool
+        self, instrument_token: int, return_db_details: bool
     ) -> Dict[str, Any]:
         """
         Retrieves instrument details from the database based on the instrument token.
@@ -292,11 +292,11 @@ class TickerTape:
             return {}  # Return an empty dict in case of any exception
 
     def get_details(
-            self,
-            tradingsymbol: Optional[str] = None,
-            exchange: Optional[str] = None,
-            instrument_token: Optional[int] = None,
-            return_db_details: bool = False,
+        self,
+        tradingsymbol: Optional[str] = None,
+        exchange: Optional[str] = None,
+        instrument_token: Optional[int] = None,
+        return_db_details: bool = False,
     ) -> Dict[str, Any]:
         """
         Get details of an instrument from the database based on either (tradingsymbol and exchange) or (instrument token).
@@ -346,7 +346,7 @@ class TickerTape:
 
     @staticmethod
     def _get_historical_data(
-            session: Session, instrument_token: int, interval: str
+        session: Session, instrument_token: int, interval: str
     ) -> pd.DataFrame:
         query = select(
             HistoricalData.instrument_token,
@@ -442,11 +442,11 @@ class TickerTape:
         return df
 
     def _get_futures_data(
-            self,
-            session: Session,
-            tradingsymbol: str,
-            exchange: str,
-            interval: str,
+        self,
+        session: Session,
+        tradingsymbol: str,
+        exchange: str,
+        interval: str,
     ) -> pd.DataFrame:
         mapped_symbol, expiry_day = self.MAPPING_INDICES_TO_FO_SYMBOLS.get(
             (tradingsymbol, exchange), (tradingsymbol, "Thursday")
@@ -536,7 +536,7 @@ class TickerTape:
         return renamed_df
 
     def _get_spot_data(
-            self, session: Session, tradingsymbol: str, exchange: str, interval: str
+        self, session: Session, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
         logger.info(
             f"tt:_get_spot_data: querying for equity data of {tradingsymbol}@{exchange} with interval {interval}"
@@ -583,31 +583,37 @@ class TickerTape:
         # Calculate the ratio between futures and spot prices
         df["fut_price_ratio"] = df["fut_close"] / df["spot_close"]
 
-        def estimate_split_ratio(ratio: float) -> float:
-            if ratio > 1.5:
-                # Consider split ratios from 2 to 100
-                possible_splits = np.arange(2, 101)
-                # Find the split ratio that minimizes the difference
-                best_split = min(possible_splits, key=lambda x: abs(ratio - x))
-                return best_split * 1.0
-            return 1.0
+        def to_nearest_x1_multiple(value: float) -> float:
+            # Check if the value is np.nan or pd.NA
+            if pd.isna(value):
+                return np.nan
+
+            # Get the order of magnitude of the value
+            order = math.floor(math.log10(abs(value)))
+
+            # Calculate the x1 multiple for this order of magnitude
+            x1_multiple = 10**order
+
+            # Round to the nearest x1 multiple
+            return round(value / x1_multiple) * x1_multiple
 
         # Apply the split ratio estimation
-        df["fut_estimated_split"] = df["fut_price_ratio"].apply(estimate_split_ratio)
+        df["fut_estimated_split"] = df["fut_price_ratio"].apply(to_nearest_x1_multiple)
 
         # Adjust the futures price
         df["fut_open"] = df["fut_open"] / df["fut_estimated_split"]
         df["fut_high"] = df["fut_high"] / df["fut_estimated_split"]
         df["fut_low"] = df["fut_low"] / df["fut_estimated_split"]
         df["fut_close"] = df["fut_close"] / df["fut_estimated_split"]
+        df["fut_close_mid"] = df["fut_close_mid"] / df["fut_estimated_split"]
+        df["fut_close_far"] = df["fut_close_far"] / df["fut_estimated_split"]
         df["fut_volume"] = df["fut_volume"] * df["fut_estimated_split"]
         df["fut_oi"] = df["fut_oi"] * df["fut_estimated_split"]
         df["spot_volume"] = df["spot_volume"] * df["fut_estimated_split"]
-
         return df
 
     def _get_data_for_x_by_symbol(
-            self, tradingsymbol: str, exchange: str, interval: str
+        self, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
         try:
             with self._session_scope() as session:
@@ -659,7 +665,7 @@ class TickerTape:
             return pd.DataFrame()
 
     def _get_data_for_x_by_token(
-            self, instrument_token: int, interval: str
+        self, instrument_token: int, interval: str
     ) -> pd.DataFrame:
         try:
             with self._session_scope() as session:
@@ -690,12 +696,42 @@ class TickerTape:
                 pd.DataFrame()
             )  # Return an empty pd.DataFrame in case of any exception
 
+    @staticmethod
+    def _standardize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+        dtype_mapping = {"Float64": "float64", "Int64": "int64", "UInt32": "uint32"}
+
+        for column in df.columns:
+            current_dtype = str(df[column].dtype)
+            if current_dtype in dtype_mapping:
+                try:
+                    df[column] = df[column].astype(dtype_mapping[current_dtype])
+                except ValueError as e:
+                    print(
+                        f"Warning: Could not convert column {column} to {dtype_mapping[current_dtype]}. Error: {e}"
+                    )
+                    # If conversion fails, we might want to handle NaN values
+                    if pd.api.types.is_float_dtype(df[column]):
+                        df[column] = df[column].astype("float64")
+                    elif pd.api.types.is_integer_dtype(df[column]):
+                        # For integer columns with NaN, we need to use float
+                        df[column] = df[column].astype("float64")
+
+        # Convert any remaining object columns to appropriate types
+        for column in df.select_dtypes(include=["object"]):
+            try:
+                df[column] = pd.to_numeric(df[column])
+            except ValueError:
+                # If conversion to numeric fails, leave as object
+                pass
+
+        return df
+
     def get_data_for_x(
-            self,
-            tradingsymbol: Optional[str] = None,
-            exchange: Optional[str] = None,
-            instrument_token: Optional[int] = None,
-            interval: str = "day",
+        self,
+        tradingsymbol: Optional[str] = None,
+        exchange: Optional[str] = None,
+        instrument_token: Optional[int] = None,
+        interval: str = "day",
     ) -> pd.DataFrame:
         """
         Returns combined pd.DataFrame of equity and/or indices, with futures and vix with date index
@@ -719,6 +755,20 @@ class TickerTape:
                 raise ValueError(
                     "tt:get_data_for_x: invalid parameters! provide either (tradingsymbol, exchange) or instrument_token"
                 )
+
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+
+            df["fut_oi"] = df["fut_oi"].replace(0.0, np.nan).ffill().fillna(0)
+            df["index_oi"] = df["index_oi"].replace(0.0, np.nan).ffill().fillna(0)
+            df["spot_volume"] = df["spot_volume"].replace(0.0, np.nan).ffill().fillna(0)
+            df["fut_volume"] = df["fut_volume"].replace(0.0, np.nan).ffill().fillna(0)
+            df["index_volume"] = (
+                df["index_volume"].replace(0.0, np.nan).ffill().fillna(0)
+            )
+            df = df.drop(["index_spot_volume"], axis=1)
+
+            df = self._standardize_dtypes(df)
             return df
         except Exception as e:
             logger.error(f"tt:get_data_for_x: an error occurred: {str(e)}")

@@ -1,8 +1,10 @@
-from datetime import datetime, timedelta
+import calendar
+from datetime import datetime, timedelta, date
 from typing import Optional, Tuple
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text, func
+from dateutil.relativedelta import relativedelta, TH, WE
+from sqlalchemy import create_engine, inspect, text, func, select, and_
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from sqlalchemy.orm import Session
@@ -18,6 +20,7 @@ from ticker_api.ticker_database.schema import (
     HistoricalDataSyncDetails,
     HistoricalData,
     Instruments,
+    FNOExpiryDates,
 )
 
 logger = get_logger()
@@ -25,12 +28,12 @@ logger = get_logger()
 
 class TickerDatabase:
     def __init__(
-        self,
-        token: str,
-        redis_host: str = "127.0.0.1",
-        redis_password: str = "",
-        redis_port: int = 6379,
-        redis_db: int = 0,
+            self,
+            token: str,
+            redis_host: str = "127.0.0.1",
+            redis_password: str = "",
+            redis_port: int = 6379,
+            redis_db: int = 0,
     ):
         """
         Provides high level methods to house keep market data using Zerodha API in MySQL database.
@@ -60,6 +63,11 @@ class TickerDatabase:
             token, redis_host, redis_password, redis_port, redis_db
         )
 
+        # Load trading holidays from config
+        self.trading_holidays = [
+            date.fromisoformat(d) for d in self.config.get("trading_holidays", [])
+        ]
+
     def sync_instruments(self):
         """
         Synchronize instruments data with database.
@@ -86,17 +94,236 @@ class TickerDatabase:
                 num_records_affected = instruments_df.to_sql(
                     "instruments", con=engine, if_exists="append", index=False
                 )
+
+            self._update_fno_expiry_dates()
+
             logger.info(
-                f"td:sync_instruments: successful for  #{num_records_affected} records"
+                f"td::sync_instruments:: successful for  #{num_records_affected} records"
             )
         except SQLAlchemyError as e:
             logger.error(
-                f"td:sync_instruments: error while syncing instruments data: {str(e)}"
+                f"td::sync_instruments:: error while syncing instruments data: {str(e)}"
             )
+
+    def _update_fno_expiry_dates(self):
+        """
+        Update FNO expiry dates table with distinct expiry dates from instruments table.
+        """
+        try:
+            # Connect to the specific database
+            engine = create_engine(
+                self.db_connection_string + self.db_schema_name, echo=False
+            )
+
+            with Session(engine) as session:
+                # Query distinct tuples from instruments table
+                stmt = (
+                    select(
+                        Instruments.exchange,
+                        Instruments.segment,
+                        Instruments.name,
+                        Instruments.instrument_type,
+                        Instruments.expiry,
+                    )
+                    .distinct()
+                    .where(and_(
+                        Instruments.expiry.isnot(None),
+                        Instruments.instrument_type == 'FUT'
+                    ))
+                )
+
+                result = session.execute(stmt)
+
+                # Prepare data for insertion
+                data_to_insert = []
+                for row in result:
+                    expiry_date = row.expiry
+                    data_to_insert.append(
+                        {
+                            "exchange": row.exchange,
+                            "segment": row.segment,
+                            "name": row.name,
+                            "instrument_type": row.instrument_type,
+                            "expiry_date": expiry_date,
+                            "expiry_weekday": expiry_date.strftime("%A"),
+                            "status": 1,
+                        }
+                    )
+
+                # Perform upsert operation
+                stmt = insert(FNOExpiryDates).values(data_to_insert)
+                stmt = stmt.on_duplicate_key_update(
+                    {
+                        "expiry_weekday": stmt.inserted.expiry_weekday,
+                        "status": 1,
+                        "updated_at": sql_func.now(),  # Set the current timestamp
+                    }
+                )
+
+                session.execute(stmt)
+                session.commit()
+
+            logger.info(
+                "td::update_fno_expiry_dates:: fno_expiry_dates updated successfully"
+            )
+        except SQLAlchemyError as e:
+            logger.error(
+                f"td::update_fno_expiry_dates:: error while updating fno_expiry_dates: {str(e)}"
+            )
+
+    def _is_trading_day(self, check_date):
+        """
+        Check if the given date is a trading day (not a weekend or holiday).
+        """
+        return check_date.weekday() < 5 and check_date not in self.trading_holidays
+
+    def _get_last_valid_trading_day(self, year, month, name):
+        """
+        Get the last valid trading day of the given month and year.
+
+        For BANKNIFTY, use Friday instead of Thursday from July 2023 onwards.
+        https://www.moneycontrol.com/news/business/markets/nse-changes-nifty-bank-fo-expiry-day-to-friday-from-thursday-10749221.html
+        https://www.thehindubusinessline.com/markets/banknifty-expiry-shifted-to-wednesday-from-september/article67179068.ece
+        """
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+
+        if name == "BANKNIFTY" and date(year, month, 1) >= date(2023, 9, 6):
+            last_expiry_day = last_day + relativedelta(weekday=WE(-1))
+        else:
+            last_expiry_day = last_day + relativedelta(weekday=TH(-1))
+
+        while not self._is_trading_day(last_expiry_day):
+            last_expiry_day -= timedelta(days=1)
+
+        return last_expiry_day
+
+    def sync_historical_fno_expiry_dates(self, name: str):
+        """
+        Insert or update all expiry dates since March 1, 2009 into the fno_expiry_dates table
+        for a given instrument name, accounting for trading holidays and BANKNIFTY special case.
+
+        :param name: Instrument name
+        """
+        try:
+            engine = create_engine(
+                self.db_connection_string + self.db_schema_name, echo=False
+            )
+
+            with Session(engine) as session:
+                start_date = date(2009, 3, 1)
+                end_date = datetime.now().date()
+                current_date = start_date
+
+                expiry_dates = []
+
+                while current_date <= end_date:
+                    expiry_date = self._get_last_valid_trading_day(
+                        current_date.year, current_date.month, name
+                    )
+                    expiry_dates.append(
+                        {
+                            "exchange": "NFO",
+                            "segment": "NFO-FUT",
+                            "name": name,
+                            "instrument_type": "FUT",
+                            "expiry_date": expiry_date,
+                            "expiry_weekday": expiry_date.strftime("%A"),
+                            "status": 1,
+                        }
+                    )
+                    current_date += relativedelta(months=1)
+
+                # Perform upsert operation
+                insert_stmt = insert(FNOExpiryDates).values(expiry_dates)
+                upsert_stmt = insert_stmt.on_duplicate_key_update(
+                    expiry_weekday=insert_stmt.inserted.expiry_weekday,
+                    status=insert_stmt.inserted.status,
+                    updated_at=datetime.now(),
+                )
+                session.execute(upsert_stmt)
+                session.commit()
+
+            logger.info(
+                f"td::sync_historical_fno_expiry_dates:: successfully inserted FNO expiry dates for {name}, accounting for trading holidays"
+            )
+
+        except SQLAlchemyError as e:
+            logger.error(
+                f"td::sync_historical_fno_expiry_dates:: error inserting FNO expiry dates for {name}: {str(e)}"
+            )
+
+    def get_monthly_expiry_date(
+            self,
+            exchange: str,
+            segment: str,
+            name: str,
+            expiry: str,
+            relative_date: Optional[date] = None,
+    ) -> Optional[date]:
+        """
+        Get the monthly expiry dates based on the given parameters.
+        """
+        try:
+            params_str = f"{exchange}|{segment}|{name}|FUT|{expiry}"
+            engine = create_engine(
+                self.db_connection_string + self.db_schema_name, echo=False
+            )
+
+            with Session(engine) as session:
+                # Determine the reference date
+                ref_date = relative_date if relative_date else datetime.now().date()
+
+                # Query for FUT instrument_type
+                query = (
+                    select(FNOExpiryDates.expiry_date)
+                    .where(
+                        FNOExpiryDates.exchange == exchange,
+                        FNOExpiryDates.segment == segment,
+                        FNOExpiryDates.name == name,
+                        FNOExpiryDates.instrument_type == "FUT",
+                        FNOExpiryDates.expiry_date >= ref_date,
+                    )
+                    .order_by(FNOExpiryDates.expiry_date)
+                    .limit(3)
+                )
+
+                result = session.execute(query).fetchall()
+
+                if not result:
+                    logger.warning(
+                        f"td::get_monthly_expiry_dates:: no expiry dates found for the given parameters: {params_str}"
+                    )
+                    return None
+
+                expiry_dates = [row[0] for row in result]
+
+                if len(expiry_dates) < 3:
+                    logger.warning(
+                        f"td::get_monthly_expiry_dates:: less than three expiry dates found for the given parameters: {params_str}"
+                    )
+                    return None
+
+                if expiry.upper() == "CURRENT":
+                    return expiry_dates[0]
+                elif expiry.upper() == "MID":
+                    return expiry_dates[1]
+                elif expiry.upper() == "FAR":
+                    return expiry_dates[2]
+                else:
+                    logger.error(
+                        f"td::get_monthly_expiry_dates:: invalid expiry type: {expiry}. Must be CURRENT, MID, or FAR."
+                    )
+                    return None
+
+        except SQLAlchemyError as e:
+            logger.error(
+                f"td::get_monthly_expiry_dates:: error in get_expiry_date: {str(e)}"
+            )
+            return None
 
     @staticmethod
     def _get_sync_details(
-        session: Session, instrument_token: int, interval: str
+            session: Session, instrument_token: int, interval: str
     ) -> Optional[HistoricalDataSyncDetails]:
         return (
             session.query(HistoricalDataSyncDetails)
@@ -106,7 +333,7 @@ class TickerDatabase:
 
     @staticmethod
     def _get_instrument_details(
-        session: Session, instrument_token: int
+            session: Session, instrument_token: int
     ) -> Optional[Tuple[str, str, str]]:
         """
         Retrieve instrument details for a given instrument token.
@@ -116,9 +343,7 @@ class TickerDatabase:
         :return: Tuple of (instrument_type, tradingsymbol, exchange) if found, None otherwise
         """
         instrument = (
-            session.query(Instruments)
-            .filter_by(instrument_token=instrument_token)
-            .first()
+            session.query(Instruments).filter_by(exchange=instrument_token).first()
         )
         if instrument:
             return (
@@ -130,12 +355,12 @@ class TickerDatabase:
 
     @staticmethod
     def _insert_or_update_historical_data(
-        session: Session,
-        df: pd.DataFrame,
-        interval: str,
-        tradingsymbol: str,
-        exchange: str,
-        continuous: bool,
+            session: Session,
+            df: pd.DataFrame,
+            interval: str,
+            tradingsymbol: str,
+            exchange: str,
+            continuous: bool,
     ):
         # Prepare the data
         data = [
@@ -178,14 +403,14 @@ class TickerDatabase:
 
     @staticmethod
     def _update_sync_details(
-        session: Session,
-        instrument_token: int,
-        tradingsymbol: str,
-        exchange: str,
-        interval: str,
-        min_date: datetime.date,
-        max_date: datetime.date,
-        fut_contract_type: str,
+            session: Session,
+            instrument_token: int,
+            tradingsymbol: str,
+            exchange: str,
+            interval: str,
+            min_date: datetime.date,
+            max_date: datetime.date,
+            fut_contract_type: str,
     ):
         stmt = insert(HistoricalDataSyncDetails).values(
             instrument_token=instrument_token,
@@ -213,23 +438,30 @@ class TickerDatabase:
         session.flush()
 
     def sync_historical_data(
-        self,
-        instrument_token: int,
-        interval: str,
-        fut_contract_type: Optional[str] = None,
+            self,
+            exchange: str,
+            segment: str,
+            name: str,
+            instrument_type: str,
+            expiry: str,
+            interval: str,
     ):
         """
-        Synchronize historical data for given instrument_token with database.
+        Synchronize historical data for given instrument with database.
 
-        :param instrument_token: The instrument token to fetch data for
+        :param exchange: The exchange identifier (e.g. NSE for National Stock Exchange and so on...)
+        :param segment: The exchange segment identifier (e.g. NSE, BSE, NFO-FUT, BFO-FUT, MCX-FUT etc.)
+        :param name: The name of instrument to sync (e.g. `NIFTY 50', TATAMOTORS etc.)
+        :param instrument_type: The type of instrument (e.g. EQ, FUT, CE, PE etc.)
+        :param expiry: FnO contract expiry type identifier (CURRENT, MID, FAR) or NONE otherwise.
         :param interval: The time interval for the data (e.g., 'day', '15minute'. '5minute').
-        :param fut_contract_type: Futures contract type identifier (current, mid, far) or None otherwise.
         :return:
         """
         try:
-            logger.info(
-                f"td:sync_historical_data: starting sync for instrument_token {instrument_token} with interval '{interval}'"
+            params_str = (
+                f"{exchange}|{segment}|{name}|{instrument_type}|{expiry}|{interval}"
             )
+            logger.info(f"td::sync_historical_data: starting sync for {params_str}")
 
             # Connect to the specific database
             engine = create_engine(
@@ -238,11 +470,11 @@ class TickerDatabase:
 
             with Session(engine) as session:
                 instrument_details = self._get_instrument_details(
-                    session, instrument_token
+                    session, exchange, segment, name, instrument_type, expiry
                 )
                 if not instrument_details:
                     logger.error(
-                        f"td:sync_historical_data: instrument details not found for token {instrument_token}"
+                        f"td::sync_historical_data: instrument details not found for {params_str}"
                     )
                     return
 
@@ -257,7 +489,7 @@ class TickerDatabase:
                     to_date = datetime.now().date()
                 else:
                     logger.info(
-                        f"td:sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from '2009-03-01'"
+                        f"td::sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from '2009-03-01'"
                     )
                     from_date = datetime(
                         2009, 3, 1
@@ -283,7 +515,7 @@ class TickerDatabase:
                         continuous,
                     )
                     logger.info(
-                        f"td:sync_historical_data: inserted/updated {len(historical_df)} records for instrument_token {instrument_token}"
+                        f"td::sync_historical_data: inserted/updated {len(historical_df)} records for instrument_token {instrument_token}"
                     )
 
                     min_max_dates = (
@@ -296,9 +528,9 @@ class TickerDatabase:
                     )
 
                     if (
-                        min_max_dates
-                        and min_max_dates.min_date
-                        and min_max_dates.max_date
+                            min_max_dates
+                            and min_max_dates.min_date
+                            and min_max_dates.max_date
                     ):
                         self._update_sync_details(
                             session,
@@ -311,31 +543,31 @@ class TickerDatabase:
                             fut_contract_type,
                         )
                         logger.info(
-                            f"td:sync_historical_data: updated sync details for instrument_token {instrument_token}"
+                            f"td::sync_historical_data: updated sync details for instrument_token {instrument_token}"
                         )
                     else:
                         logger.warning(
-                            f"td:sync_historical_data: no data found for instrument_token {instrument_token}"
+                            f"td::sync_historical_data: no data found for instrument_token {instrument_token}"
                         )
                 else:
                     logger.warning(
-                        f"td:sync_historical_data: no historical data retrieved for instrument_token {instrument_token}"
+                        f"td::sync_historical_data: no historical data retrieved for instrument_token {instrument_token}"
                     )
 
                 session.commit()
 
             logger.info(
-                f"td:sync_historical_data: sync for instrument_token {instrument_token} with interval '{interval}' completed."
+                f"td::sync_historical_data: sync for instrument_token {instrument_token} with interval '{interval}' completed."
             )
         except SQLAlchemyError as e:
             logger.error(
-                f"td:sync_historical_data: sqlalchemy error syncing historical data for instrument_token {instrument_token}: {str(e)}"
+                f"td::sync_historical_data: sqlalchemy error syncing historical data for instrument_token {instrument_token}: {str(e)}"
             )
             if "session" in locals():
                 session.rollback()
         except Exception as e:
             logger.error(
-                f"td:sync_historical_data: unexpected error syncing historical data for instrument_token {instrument_token}: {str(e)}"
+                f"td::sync_historical_data: unexpected error syncing historical data for instrument_token {instrument_token}: {str(e)}"
             )
             if "session" in locals():
                 session.rollback()
@@ -347,7 +579,7 @@ class TickerDatabase:
         :return:
         """
         logger.info(
-            "td:sync_historical_data_all: starting synchronization for all historical data"
+            "td::sync_historical_data_all: starting synchronization for all historical data"
         )
 
         try:
@@ -366,16 +598,16 @@ class TickerDatabase:
 
                 total_instruments = len(sync_details)
                 logger.info(
-                    f"td:sync_historical_data_all: found {total_instruments} instruments to synchronize"
+                    f"td::sync_historical_data_all: found {total_instruments} instruments to synchronize"
                 )
 
                 # Step 2: Iterate through the tuples and call sync_historical_data
                 for i, (instrument_token, interval, fut_contract_type) in enumerate(
-                    sync_details, 1
+                        sync_details, 1
                 ):
                     try:
                         logger.info(
-                            f"td:sync_historical_data_all: syncing instrument {i}/{total_instruments} - "
+                            f"td::sync_historical_data_all: syncing instrument {i}/{total_instruments} - "
                             f"token: {instrument_token}, interval: {interval}, "
                             f"future contract type: {fut_contract_type or 'N/A'}"
                         )
@@ -387,24 +619,24 @@ class TickerDatabase:
                         )
                     except Exception as e:
                         logger.error(
-                            f"td:sync_historical_data_all: error syncing data for instrument {instrument_token}, "
+                            f"td::sync_historical_data_all: error syncing data for instrument {instrument_token}, "
                             f"interval {interval}: {str(e)}"
                         )
 
                 logger.info(
-                    "td:sync_historical_data_all: completed synchronization for all historical data"
+                    "td::sync_historical_data_all: completed synchronization for all historical data"
                 )
 
         except SQLAlchemyError as e:
             logger.error(
-                f"td:sync_historical_data_all: sqlalchemy error during synchronization: {str(e)}"
+                f"td::sync_historical_data_all: sqlalchemy error during synchronization: {str(e)}"
             )
         except Exception as e:
             logger.error(
-                f"td:sync_historical_data_all: unexpected error during synchronization: {str(e)}"
+                f"td::sync_historical_data_all: unexpected error during synchronization: {str(e)}"
             )
         logger.info(
-            "td:sync_historical_data_all: finished historical data synchronization process"
+            "td::sync_historical_data_all: finished historical data synchronization process"
         )
 
     def _create_database_if_not_exists(self):
@@ -415,11 +647,11 @@ class TickerDatabase:
                 )
                 connection.execute(text(f"USE {self.db_schema_name}"))
             logger.info(
-                f"td:_create_database_if_not_exists: database '{self.db_schema_name}' created or already exists."
+                f"td::_create_database_if_not_exists: database '{self.db_schema_name}' created or already exists."
             )
         except SQLAlchemyError as e:
             logger.error(
-                f"td:_create_database_if_not_exists: error creating database: {str(e)}"
+                f"td::_create_database_if_not_exists: error creating database: {str(e)}"
             )
             raise
 
@@ -441,11 +673,13 @@ class TickerDatabase:
 
             if not existing_tables:
                 Base.metadata.create_all(self.engine)
-                logger.info("td:create_schema: schema created successfully.")
+                logger.info("td::create_schema: schema created successfully.")
             else:
-                logger.info("td:create_schema: schema already exists, no action taken.")
+                logger.info(
+                    "td::create_schema: schema already exists, no action taken."
+                )
         except SQLAlchemyError as e:
-            logger.error(f"td:create_schema: error creating schema: {str(e)}")
+            logger.error(f"td::create_schema: error creating schema: {str(e)}")
 
     def delete_schema(self):
         """
@@ -465,11 +699,11 @@ class TickerDatabase:
             try:
                 # Drop the alembic_version table if it exists
                 connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
-                logger.info("td:delete_schema: alembic_version table dropped.")
+                logger.info("td::delete_schema: alembic_version table dropped.")
 
                 # Drop all tables defined in the SQLAlchemy models
                 Base.metadata.drop_all(engine)
-                logger.info("td:delete_schema: all model-defined tables dropped.")
+                logger.info("td::delete_schema: all model-defined tables dropped.")
 
                 # Close the connection to the specific database
                 connection.close()
@@ -484,7 +718,7 @@ class TickerDatabase:
                     text(f"DROP DATABASE IF EXISTS {self.db_schema_name}")
                 )
                 logger.info(
-                    f"td:delete_schema: database '{self.db_schema_name}' deleted."
+                    f"td::delete_schema: database '{self.db_schema_name}' deleted."
                 )
 
             finally:
@@ -495,9 +729,9 @@ class TickerDatabase:
         except OperationalError as e:
             if "Unknown database" in str(e):
                 logger.info(
-                    f"td:delete_schema: database '{self.db_schema_name}' does not exist. No action needed."
+                    f"td::delete_schema: database '{self.db_schema_name}' does not exist. No action needed."
                 )
             else:
-                logger.error(f"td:delete_schema: operational error: {str(e)}")
+                logger.error(f"td::delete_schema: operational error: {str(e)}")
         except SQLAlchemyError as e:
-            logger.error(f"td:delete_schema: error deleting schema: {str(e)}")
+            logger.error(f"td::delete_schema: error deleting schema: {str(e)}")

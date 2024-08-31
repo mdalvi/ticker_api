@@ -17,26 +17,65 @@ from sqlalchemy.ext.declarative import declarative_base
 Base = declarative_base()
 
 
+# ====================================
+# FNO Expiry Dates Table
+# ====================================
+class FNOExpiryDates(Base):
+    __tablename__ = "fno_expiry_dates"
+    __table_args__ = (
+        Index("idx_exchange", "exchange"),
+        Index("idx_segment", "segment"),
+        Index("idx_name", "name"),
+        Index("idx_instrument_type", "instrument_type"),
+        Index("idx_expiry_date", "expiry_date"),
+        UniqueConstraint(
+            "exchange", "segment", "name", "instrument_type", "expiry_date"
+        ),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    exchange = Column(String(10), nullable=False)
+    segment = Column(String(10), nullable=False)
+    name = Column(String(255), nullable=False)
+    instrument_type = Column(String(10), nullable=False)
+    expiry_date = Column(Date, nullable=False)
+    expiry_weekday = Column(String(10), nullable=False)
+    status = Column(SmallInteger, nullable=False, server_default="1")
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.current_timestamp(),
+    )
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
 # =============================
 # Historical Updates Table
 # =============================
 class HistoricalDataSyncDetails(Base):
     __tablename__ = "historical_data_sync_details"
     __table_args__ = (
-        Index("idx_instrument_token", "instrument_token"),
         Index("idx_exchange", "exchange"),
+        Index("idx_segment", "segment"),
+        Index("idx_name", "name"),
+        Index("idx_instrument_type", "instrument_type"),
+        Index("idx_expiry", "expiry"),
         Index("idx_interval", "interval"),
-        Index("idx_fut_contract_type", "fut_contract_type"),
-        UniqueConstraint("instrument_token", "interval"),
+        UniqueConstraint(
+            "exchange", "segment", "name", "instrument_type", "expiry", "interval"
+        ),
         {"mysql_engine": "InnoDB"},
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    instrument_token = Column(Integer, nullable=False)
-    tradingsymbol = Column(String(255), nullable=False)
     exchange = Column(String(10), nullable=False)
+    segment = Column(String(10), nullable=False)
+    name = Column(String(255), nullable=False)
+    instrument_type = Column(String(10), nullable=False)
+    expiry = Column(String(10), nullable=False)  # `NONE`, `CURRENT`, `MID` OR `FAR`
     interval = Column(String(8), nullable=False)
-    fut_contract_type = Column(String(8), nullable=True)
     from_date = Column(Date, nullable=False)
     to_date = Column(Date, nullable=False)
     status = Column(SmallInteger, nullable=False, server_default="1")
@@ -55,19 +94,31 @@ class HistoricalDataSyncDetails(Base):
 class HistoricalData(Base):
     __tablename__ = "historical_data"
     __table_args__ = (
-        Index("idx_instrument_token", "instrument_token"),
-        Index("idx_record_datetime", "record_datetime"),
+        Index("idx_exchange", "exchange"),
+        Index("idx_segment", "segment"),
+        Index("idx_name", "name"),
+        Index("idx_instrument_type", "instrument_type"),
+        Index("idx_expiry", "expiry"),
         Index("idx_interval", "interval"),
         Index("idx_record_date", "record_date"),
-        Index("idx_record_time", "record_time"),
-        UniqueConstraint("instrument_token", "record_datetime", "interval"),
+        UniqueConstraint(
+            "record_datetime",
+            "exchange",
+            "segment",
+            "name",
+            "instrument_type",
+            "expiry",
+            "interval",
+        ),
         {"mysql_engine": "InnoDB"},
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    instrument_token = Column(Integer, nullable=False)
-    tradingsymbol = Column(String(255), nullable=False)
     exchange = Column(String(10), nullable=False)
+    segment = Column(String(10), nullable=False)
+    name = Column(String(255), nullable=False)
+    instrument_type = Column(String(10), nullable=False)
+    expiry = Column(String(10), nullable=False)  # `NONE`, `CURRENT`, `MID` OR `FAR`
     record_datetime = Column(DateTime, nullable=False)
     record_date = Column(Date, nullable=False)
     record_time = Column(Time, nullable=False)
