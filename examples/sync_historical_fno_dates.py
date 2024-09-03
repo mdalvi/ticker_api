@@ -4,7 +4,9 @@ from ticker_api import TickerDatabase
 
 def main():
     # Set up argument parser
-    parser = argparse.ArgumentParser(description="Sync historical FNO expiry date with TickerDatabase for known symbols")
+    parser = argparse.ArgumentParser(
+        description="Sync historical FNO expiry date with TickerDatabase for known symbols"
+    )
     parser.add_argument("token", help="Zerodha API encrypted token")
 
     # Parse arguments
@@ -13,6 +15,7 @@ def main():
     # Initialize TickerDatabase with the provided token
     ticker_db = TickerDatabase(args.token)
     tradingsymbols = [
+        "INDIA VIX",
         "NIFTY",
         "BANKNIFTY",
         "ABB",
@@ -200,7 +203,9 @@ def main():
 
     for symbol in tradingsymbols:
         ticker_db.sync_historical_fno_expiry_dates(name=symbol)
-    print('FNO dates sync success!')
+
+    print("FNO dates sync completed!")
+
 
 if __name__ == "__main__":
     main()

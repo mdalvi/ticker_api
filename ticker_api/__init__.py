@@ -1,6 +1,6 @@
 import logging
 
-from ticker_api.settings import set_configuration
+from ticker_api.settings import set_configuration, configure_logger
 from ticker_api.ticker_database.main import TickerDatabase
 from ticker_api.ticker_tape.main import TickerTape
 

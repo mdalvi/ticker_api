@@ -1,6 +1,6 @@
 import calendar
 from datetime import datetime, timedelta, date
-from typing import Optional, Tuple
+from typing import Optional
 
 import pandas as pd
 from dateutil.relativedelta import relativedelta, TH, WE
@@ -28,12 +28,12 @@ logger = get_logger()
 
 class TickerDatabase:
     def __init__(
-            self,
-            token: str,
-            redis_host: str = "127.0.0.1",
-            redis_password: str = "",
-            redis_port: int = 6379,
-            redis_db: int = 0,
+        self,
+        token: str,
+        redis_host: str = "127.0.0.1",
+        redis_password: str = "",
+        redis_port: int = 6379,
+        redis_db: int = 0,
     ):
         """
         Provides high level methods to house keep market data using Zerodha API in MySQL database.
@@ -126,10 +126,12 @@ class TickerDatabase:
                         Instruments.expiry,
                     )
                     .distinct()
-                    .where(and_(
-                        Instruments.expiry.isnot(None),
-                        Instruments.instrument_type == 'FUT'
-                    ))
+                    .where(
+                        and_(
+                            Instruments.expiry.isnot(None),
+                            Instruments.instrument_type == "FUT",
+                        )
+                    )
                 )
 
                 result = session.execute(stmt)
@@ -253,18 +255,25 @@ class TickerDatabase:
             )
 
     def get_monthly_expiry_date(
-            self,
-            exchange: str,
-            segment: str,
-            name: str,
-            expiry: str,
-            relative_date: Optional[date] = None,
+        self,
+        exchange: str,
+        segment: str,
+        name: str,
+        expiry: str,
+        relative_date: Optional[date] = None,
     ) -> Optional[date]:
         """
         Get the monthly expiry dates based on the given parameters.
         """
         try:
-            params_str = f"{exchange}|{segment}|{name}|FUT|{expiry}"
+
+            if expiry.upper() == "NONE":
+                logger.info(
+                    f"td::get_monthly_expiry_date:: returning `None` since not expiry length specified in the request."
+                )
+                return None
+
+            attr_str = f"{exchange}|{segment}|{name}|FUT|{expiry}"
             engine = create_engine(
                 self.db_connection_string + self.db_schema_name, echo=False
             )
@@ -291,7 +300,7 @@ class TickerDatabase:
 
                 if not result:
                     logger.warning(
-                        f"td::get_monthly_expiry_dates:: no expiry dates found for the given parameters: {params_str}"
+                        f"td::get_monthly_expiry_date:: no expiry dates found for the given parameters: {attr_str}"
                     )
                     return None
 
@@ -299,7 +308,7 @@ class TickerDatabase:
 
                 if len(expiry_dates) < 3:
                     logger.warning(
-                        f"td::get_monthly_expiry_dates:: less than three expiry dates found for the given parameters: {params_str}"
+                        f"td::get_monthly_expiry_date:: less than three expiry dates found for the given parameters: {attr_str}"
                     )
                     return None
 
@@ -311,63 +320,100 @@ class TickerDatabase:
                     return expiry_dates[2]
                 else:
                     logger.error(
-                        f"td::get_monthly_expiry_dates:: invalid expiry type: {expiry}. Must be CURRENT, MID, or FAR."
+                        f"td::get_monthly_expiry_date:: invalid expiry type: {expiry}. Must be CURRENT, MID, or FAR."
                     )
                     return None
 
         except SQLAlchemyError as e:
             logger.error(
-                f"td::get_monthly_expiry_dates:: error in get_expiry_date: {str(e)}"
+                f"td::get_monthly_expiry_date:: error in get_expiry_date: {str(e)}"
             )
             return None
 
     @staticmethod
-    def _get_sync_details(
-            session: Session, instrument_token: int, interval: str
+    def _get_historical_sync_details(
+        session: Session,
+        exchange: str,
+        segment: str,
+        name: str,
+        instrument_type: str,
+        expiry: str,
+        interval: str,
     ) -> Optional[HistoricalDataSyncDetails]:
         return (
             session.query(HistoricalDataSyncDetails)
-            .filter_by(instrument_token=instrument_token, interval=interval)
+            .filter_by(
+                exchange=exchange,
+                segment=segment,
+                name=name,
+                instrument_type=instrument_type,
+                expiry=expiry,
+                interval=interval,
+            )
             .first()
         )
 
-    @staticmethod
-    def _get_instrument_details(
-            session: Session, instrument_token: int
-    ) -> Optional[Tuple[str, str, str]]:
+    def _get_instrument_token_from_details(
+        self,
+        session: Session,
+        exchange: str,
+        segment: str,
+        name: str,
+        instrument_type: str,
+        expiry: str,
+    ) -> Optional[int]:
         """
-        Retrieve instrument details for a given instrument token.
+        Retrieve instrument token for a given instrument details.
+        Returns None if no instrument token is found or if more than one instrument token is found.
+        """
+        current_exp_date = self.get_monthly_expiry_date(exchange, segment, name, expiry)
 
-        :param session: SQLAlchemy session
-        :param instrument_token: The instrument token to fetch details for
-        :return: Tuple of (instrument_type, tradingsymbol, exchange) if found, None otherwise
-        """
-        instrument = (
-            session.query(Instruments).filter_by(exchange=instrument_token).first()
+        query = select(Instruments.instrument_token).where(
+            Instruments.exchange == exchange,
+            Instruments.segment == segment,
+            Instruments.name == name,
+            Instruments.instrument_type == instrument_type,
         )
-        if instrument:
-            return (
-                instrument.instrument_type,
-                instrument.tradingsymbol,
-                instrument.exchange,
-            )
-        return None
+
+        # Only add expiry to the query if current_exp_date is not None
+        if current_exp_date is not None:
+            query = query.where(Instruments.expiry == current_exp_date)
+
+        # Use func.count() to get the number of matching rows
+        count_query = select(func.count()).select_from(query.subquery())
+        count = session.scalar(count_query)
+
+        if count == 0:
+            # No instrument token found
+            return None
+        elif count > 1:
+            # More than one instrument token found
+            return None
+        else:
+            # Exactly one instrument token found
+            result = session.execute(query).scalar_one_or_none()
+            return result
 
     @staticmethod
     def _insert_or_update_historical_data(
-            session: Session,
-            df: pd.DataFrame,
-            interval: str,
-            tradingsymbol: str,
-            exchange: str,
-            continuous: bool,
+        session: Session,
+        df: pd.DataFrame,
+        exchange: str,
+        segment: str,
+        name: str,
+        instrument_type: str,
+        expiry: str,
+        interval: str,
+        continuous: bool,
     ):
         # Prepare the data
         data = [
             {
-                "instrument_token": row.instrument_token,
-                "tradingsymbol": tradingsymbol,
                 "exchange": exchange,
+                "segment": segment,
+                "name": name,
+                "instrument_type": instrument_type,
+                "expiry": expiry,
                 "record_datetime": row.record_datetime,
                 "record_date": row.record_datetime.date(),
                 "record_time": row.record_datetime.time(),
@@ -403,21 +449,23 @@ class TickerDatabase:
 
     @staticmethod
     def _update_sync_details(
-            session: Session,
-            instrument_token: int,
-            tradingsymbol: str,
-            exchange: str,
-            interval: str,
-            min_date: datetime.date,
-            max_date: datetime.date,
-            fut_contract_type: str,
+        session: Session,
+        exchange: str,
+        segment: str,
+        name: str,
+        instrument_type: str,
+        expiry: str,
+        interval: str,
+        min_date: datetime.date,
+        max_date: datetime.date,
     ):
         stmt = insert(HistoricalDataSyncDetails).values(
-            instrument_token=instrument_token,
-            tradingsymbol=tradingsymbol,
             exchange=exchange,
+            segment=segment,
+            name=name,
+            instrument_type=instrument_type,
+            expiry=expiry,
             interval=interval,
-            fut_contract_type=fut_contract_type,
             from_date=min_date,
             to_date=max_date,
             status=1,  # Assuming 1 means successfully synced
@@ -425,9 +473,6 @@ class TickerDatabase:
         )
 
         stmt = stmt.on_duplicate_key_update(
-            tradingsymbol=stmt.inserted.tradingsymbol,
-            exchange=stmt.inserted.exchange,
-            fut_contract_type=fut_contract_type,
             from_date=stmt.inserted.from_date,
             to_date=stmt.inserted.to_date,
             status=stmt.inserted.status,
@@ -438,13 +483,13 @@ class TickerDatabase:
         session.flush()
 
     def sync_historical_data(
-            self,
-            exchange: str,
-            segment: str,
-            name: str,
-            instrument_type: str,
-            expiry: str,
-            interval: str,
+        self,
+        exchange: str,
+        segment: str,
+        name: str,
+        instrument_type: str,
+        expiry: str,
+        interval: str,
     ):
         """
         Synchronize historical data for given instrument with database.
@@ -457,39 +502,42 @@ class TickerDatabase:
         :param interval: The time interval for the data (e.g., 'day', '15minute'. '5minute').
         :return:
         """
+        attr_str = f"{exchange}|{segment}|{name}|{instrument_type}|{expiry}|{interval}"
+
         try:
-            params_str = (
-                f"{exchange}|{segment}|{name}|{instrument_type}|{expiry}|{interval}"
-            )
-            logger.info(f"td::sync_historical_data: starting sync for {params_str}")
+            # Validate expiry parameter
+            if expiry not in ["NONE", "CURRENT", "MID", "FAR"]:
+                raise ValueError(
+                    f"Invalid expiry value: {expiry}. Must be one of 'NONE', 'CURRENT', 'MID', or 'FAR'."
+                )
+            logger.info(f"td::sync_historical_data:: starting sync for {attr_str}")
 
             # Connect to the specific database
             engine = create_engine(
                 self.db_connection_string + self.db_schema_name, echo=False
             )
-
             with Session(engine) as session:
-                instrument_details = self._get_instrument_details(
+                instrument_token = self._get_instrument_token_from_details(
                     session, exchange, segment, name, instrument_type, expiry
                 )
-                if not instrument_details:
+                if not instrument_token:
                     logger.error(
-                        f"td::sync_historical_data: instrument details not found for {params_str}"
+                        f"td::sync_historical_data:: instrument token not found for {attr_str}"
                     )
                     return
-
-                instrument_type, tradingsymbol, exchange = instrument_details
                 continuous = instrument_type != "EQ"
-
-                sync_details = self._get_sync_details(
-                    session, instrument_token, interval
+                logger.info(
+                    f"td::sync_historical_data:: instrument token {instrument_token} found for  {attr_str}"
+                )
+                sync_details = self._get_historical_sync_details(
+                    session, exchange, segment, name, instrument_type, expiry, interval
                 )
                 if sync_details:
                     from_date = sync_details.to_date - timedelta(days=5)
                     to_date = datetime.now().date()
                 else:
                     logger.info(
-                        f"td::sync_historical_data: no previous sync details found for instrument_token {instrument_token}; starting from '2009-03-01'"
+                        f"td::sync_historical_data:: no previous sync details found for {attr_str}: starting from '2009-03-01'"
                     )
                     from_date = datetime(
                         2009, 3, 1
@@ -509,13 +557,16 @@ class TickerDatabase:
                     self._insert_or_update_historical_data(
                         session,
                         historical_df,
-                        interval,
-                        tradingsymbol,
                         exchange,
+                        segment,
+                        name,
+                        instrument_type,
+                        expiry,
+                        interval,
                         continuous,
                     )
                     logger.info(
-                        f"td::sync_historical_data: inserted/updated {len(historical_df)} records for instrument_token {instrument_token}"
+                        f"td::sync_historical_data:: inserted/updated {len(historical_df)} records for instrument_token {instrument_token}"
                     )
 
                     min_max_dates = (
@@ -523,51 +574,57 @@ class TickerDatabase:
                             func.min(HistoricalData.record_date).label("min_date"),
                             func.max(HistoricalData.record_date).label("max_date"),
                         )
-                        .filter_by(instrument_token=instrument_token, interval=interval)
+                        .filter_by(
+                            exchange=exchange,
+                            segment=segment,
+                            name=name,
+                            instrument_type=instrument_type,
+                            expiry=expiry,
+                            interval=interval,
+                        )
                         .first()
                     )
 
                     if (
-                            min_max_dates
-                            and min_max_dates.min_date
-                            and min_max_dates.max_date
+                        min_max_dates
+                        and min_max_dates.min_date
+                        and min_max_dates.max_date
                     ):
                         self._update_sync_details(
                             session,
-                            instrument_token,
-                            tradingsymbol,
                             exchange,
+                            segment,
+                            name,
+                            instrument_type,
+                            expiry,
                             interval,
                             min_max_dates.min_date,
                             min_max_dates.max_date,
-                            fut_contract_type,
                         )
                         logger.info(
-                            f"td::sync_historical_data: updated sync details for instrument_token {instrument_token}"
+                            f"td::sync_historical_data:: updated sync details for {attr_str}"
                         )
                     else:
                         logger.warning(
-                            f"td::sync_historical_data: no data found for instrument_token {instrument_token}"
+                            f"td::sync_historical_data:: no data found for {attr_str} in historical_data table"
                         )
                 else:
                     logger.warning(
-                        f"td::sync_historical_data: no historical data retrieved for instrument_token {instrument_token}"
+                        f"td::sync_historical_data:: no historical data retrieved for {attr_str}"
                     )
 
                 session.commit()
 
-            logger.info(
-                f"td::sync_historical_data: sync for instrument_token {instrument_token} with interval '{interval}' completed."
-            )
+            logger.info(f"td::sync_historical_data:: sync for {attr_str} completed.")
         except SQLAlchemyError as e:
             logger.error(
-                f"td::sync_historical_data: sqlalchemy error syncing historical data for instrument_token {instrument_token}: {str(e)}"
+                f"td::sync_historical_data:: sqlalchemy error syncing historical data for {attr_str}: {str(e)}"
             )
             if "session" in locals():
                 session.rollback()
         except Exception as e:
             logger.error(
-                f"td::sync_historical_data: unexpected error syncing historical data for instrument_token {instrument_token}: {str(e)}"
+                f"td::sync_historical_data:: unexpected error syncing historical data for {attr_str}: {str(e)}"
             )
             if "session" in locals():
                 session.rollback()
@@ -603,7 +660,7 @@ class TickerDatabase:
 
                 # Step 2: Iterate through the tuples and call sync_historical_data
                 for i, (instrument_token, interval, fut_contract_type) in enumerate(
-                        sync_details, 1
+                    sync_details, 1
                 ):
                     try:
                         logger.info(
