@@ -636,7 +636,7 @@ class TickerDatabase:
         :return:
         """
         logger.info(
-            "td::sync_historical_data_all: starting synchronization for all historical data"
+            "td::sync_historical_data_all:: starting synchronization for all historical data"
         )
 
         try:
@@ -648,36 +648,45 @@ class TickerDatabase:
             with Session(engine) as session:
                 # Step 1: Select all tuples from historical_data_sync_details
                 sync_details = session.query(
-                    HistoricalDataSyncDetails.instrument_token,
+                    HistoricalDataSyncDetails.exchange,
+                    HistoricalDataSyncDetails.segment,
+                    HistoricalDataSyncDetails.name,
+                    HistoricalDataSyncDetails.instrument_type,
+                    HistoricalDataSyncDetails.expiry,
                     HistoricalDataSyncDetails.interval,
-                    HistoricalDataSyncDetails.fut_contract_type,
                 ).all()
 
                 total_instruments = len(sync_details)
                 logger.info(
-                    f"td::sync_historical_data_all: found {total_instruments} instruments to synchronize"
+                    f"td::sync_historical_data_all:: found {total_instruments} instruments to synchronize"
                 )
 
                 # Step 2: Iterate through the tuples and call sync_historical_data
-                for i, (instrument_token, interval, fut_contract_type) in enumerate(
-                    sync_details, 1
-                ):
+                for i, (
+                    exchange,
+                    segment,
+                    name,
+                    instrument_type,
+                    expiry,
+                    interval,
+                ) in enumerate(sync_details, 1):
                     try:
+                        attr_str = f"{exchange}|{segment}|{name}|{instrument_type}|{expiry}|{interval}"
                         logger.info(
-                            f"td::sync_historical_data_all: syncing instrument {i}/{total_instruments} - "
-                            f"token: {instrument_token}, interval: {interval}, "
-                            f"future contract type: {fut_contract_type or 'N/A'}"
+                            f"td::sync_historical_data_all:: syncing instrument {i}/{total_instruments} - {attr_str}"
                         )
 
                         self.sync_historical_data(
-                            instrument_token=instrument_token,
+                            exchange=exchange,
+                            segment=segment,
+                            name=name,
+                            instrument_type=instrument_type,
+                            expiry=expiry,
                             interval=interval,
-                            fut_contract_type=fut_contract_type,
                         )
                     except Exception as e:
                         logger.error(
-                            f"td::sync_historical_data_all: error syncing data for instrument {instrument_token}, "
-                            f"interval {interval}: {str(e)}"
+                            f"td::sync_historical_data_all:: error syncing data for {attr_str}: {str(e)}"
                         )
 
                 logger.info(
@@ -686,14 +695,14 @@ class TickerDatabase:
 
         except SQLAlchemyError as e:
             logger.error(
-                f"td::sync_historical_data_all: sqlalchemy error during synchronization: {str(e)}"
+                f"td::sync_historical_data_all:: sqlalchemy error during synchronization: {str(e)}"
             )
         except Exception as e:
             logger.error(
-                f"td::sync_historical_data_all: unexpected error during synchronization: {str(e)}"
+                f"td::sync_historical_data_all:: unexpected error during synchronization: {str(e)}"
             )
         logger.info(
-            "td::sync_historical_data_all: finished historical data synchronization process"
+            "td::sync_historical_data_all:: finished historical data synchronization process"
         )
 
     def _create_database_if_not_exists(self):
