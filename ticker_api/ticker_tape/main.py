@@ -1,43 +1,38 @@
-import calendar
+import math
 import re
 from contextlib import contextmanager
 from datetime import datetime, date, time
 from decimal import Decimal
-from typing import Optional, Dict, Any
-import math
+from typing import Optional, Dict, Any, List
+
 import numpy as np
 import pandas as pd
 import pytz
-from dateutil.relativedelta import relativedelta, TH, WE, FR, MO
 from sqlalchemy import select, create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker, Session
 
 from ticker_api.exceptions import (
     InvalidExchangeException,
-    InvalidInstrumentCategoryException,
 )
 from ticker_api.settings import get_configuration, get_logger
-from ticker_api.ticker_database.schema import Instruments, HistoricalData
+from ticker_api.ticker_database.schema import (
+    Instruments,
+    HistoricalData,
+    FNOExpiryDates,
+)
 
 logger = get_logger()
 
 
 class TickerTape:
-    SUPPORTED_EXCHANGES = {"NSE", "BSE", "NFO", "BFO"}
-    MAPPING_INDICES_TO_FO_SYMBOLS = {
-        ("NIFTY 50", "NSE"): ("NIFTY", "Thursday"),
-        ("NIFTY BANK", "NSE"): ("BANKNIFTY", "Wednesday"),
-        # https://blog.dhan.co/sensex-and-bankex-fo-expiry-days/
-        ("SENSEX", "BSE"): ("SENSEX", "Friday"),
-        ("BANKEX", "BSE"): ("BANKEX", "Monday"),
-        # Add other symbols here if needed, with custom day as the default
-        # ('SOME_OTHER_SYMBOL', 'EXCHANGE'): ('OTHER_SYMBOL', 'EXPIRY_DAY'),
-        # TODO: CDS compatibility based on,
-        #  https://www.nseindia.com/products-services/currency-derivatives-contract-specification-inr
+    SUPPORTED_EXCHANGES = {"NSE", "NFO"}
+    MAPPING_INDICES_TO_FNO_NAMES = {
+        "NIFTY 50": "NIFTY",
+        "NIFTY BANK": "BANKNIFTY",
     }
-    MAPPING_FO_SYMBOLS_TO_INDICES = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
-    MAPPING_EQUITY_TO_FO_EXCHANGE = {"NSE": "NFO", "BSE": "BFO"}
+    MAPPING_EQUITY_TO_FNO_EXCHANGE = {"NSE": "NFO"}
+    MAPPING_EQUITY_TO_FNO_SEGMENT = {"NSE": "NFO-FUT"}
 
     def __init__(self):
         """
@@ -93,98 +88,120 @@ class TickerTape:
         finally:
             session.close()
 
-    @staticmethod
-    def _get_last_trading_day(year, month, expiry_weekday):
+    def _get_monthly_expiry_date(
+        self,
+        exchange: str,
+        segment: str,
+        name: str,
+        expiry: str,
+        relative_date: Optional[date] = None,
+    ) -> Optional[date]:
         """
-        Function to get the last trading day of a given month
+        Get the monthly expiry dates based on the given parameters.
         """
-        last_day = date(year, month, calendar.monthrange(year, month)[1])
-        return last_day + relativedelta(weekday=expiry_weekday(-1))
+        try:
+
+            if expiry.upper() == "NONE":
+                logger.info(
+                    f"tt::get_monthly_expiry_date:: returning `None` since not expiry length specified in the request."
+                )
+                return None
+
+            attr_str = f"{exchange}|{segment}|{name}|FUT|{expiry}"
+            with self._session_scope() as session:
+                # Determine the reference date
+                ref_date = relative_date if relative_date else datetime.now().date()
+
+                # Query for FUT instrument_type
+                query = (
+                    select(FNOExpiryDates.expiry_date)
+                    .where(
+                        FNOExpiryDates.exchange == exchange,
+                        FNOExpiryDates.segment == segment,
+                        FNOExpiryDates.name == name,
+                        FNOExpiryDates.instrument_type == "FUT",
+                        FNOExpiryDates.expiry_date >= ref_date,
+                    )
+                    .order_by(FNOExpiryDates.expiry_date)
+                    .limit(3)
+                )
+
+                result = session.execute(query).fetchall()
+
+                if not result:
+                    logger.warning(
+                        f"tt::get_monthly_expiry_date:: no expiry dates found for the given parameters: {attr_str}"
+                    )
+                    return None
+
+                expiry_dates = [row[0] for row in result]
+
+                if len(expiry_dates) < 3:
+                    logger.warning(
+                        f"tt::get_monthly_expiry_date:: less than three expiry dates found for the given parameters: {attr_str}"
+                    )
+                    return None
+
+                if expiry.upper() == "CURRENT":
+                    return expiry_dates[0]
+                elif expiry.upper() == "MID":
+                    return expiry_dates[1]
+                elif expiry.upper() == "FAR":
+                    return expiry_dates[2]
+                else:
+                    logger.error(
+                        f"tt::get_monthly_expiry_date:: invalid expiry type: {expiry}. Must be CURRENT, MID, or FAR."
+                    )
+                    return None
+
+        except SQLAlchemyError as e:
+            logger.error(
+                f"tt::get_monthly_expiry_date:: error in get_expiry_date: {str(e)}"
+            )
+            return None
 
     def _get_next_three_active_contracts(
-        self, spot_name: str, expiry_day: str, timezone: str
+        self,
+        exchange: str,
+        fno_name: str,
+        spot_name: str,
     ) -> list:
         """
         Generate the names of the next three active futures contracts.
         """
-
-        # Set up the expiry day mapping
-        expiry_day_map = {"Monday": MO, "Wednesday": WE, "Thursday": TH, "Friday": FR}
-        expiry_weekday = expiry_day_map.get(
-            expiry_day, TH
-        )  # Default to Thursday if invalid day provided
-
-        # Get current date in the specified timezone
-        current_date = datetime.now(pytz.timezone(timezone)).date()
-
-        # Get the expiry date of the current month
-        current_expiry = self._get_last_trading_day(
-            current_date.year, current_date.month, expiry_weekday
+        logger.info(
+            f"tt::_get_next_three_active_contracts:: fetching next three contract names for {exchange}|{fno_name}|{spot_name}"
         )
-
-        # Determine the start month for the next three active contracts
-        if current_date > current_expiry:
-            start_date = current_date + relativedelta(months=1)
-        else:
-            start_date = current_date
+        # Get relative date (current date) in the specified timezone
+        relative_date = datetime.now(pytz.timezone(self.config["timezone"])).date()
+        fno_exchange = self.MAPPING_EQUITY_TO_FNO_EXCHANGE.get(exchange, exchange)
+        segment = self.MAPPING_EQUITY_TO_FNO_SEGMENT.get(exchange, exchange)
 
         # Generate the next three active contract names
         contract_names = []
-        for i in range(3):
-            contract_date = start_date + relativedelta(months=i)
-            contract_name = f'{spot_name}{contract_date.strftime("%y%b")}FUT'.upper()
-            contract_names.append(contract_name)
-
-        return contract_names
-
-    def _get_dte(self, record_date: date, expiry_day: str, timezone: str) -> float:
-        """
-        Calculate the number of days to expiry for the current active contract.
-        """
-        # Set up the expiry day mapping
-        expiry_day_map = {"Monday": MO, "Wednesday": WE, "Thursday": TH, "Friday": FR}
-        expiry_weekday = expiry_day_map.get(
-            expiry_day, TH
-        )  # Default to Thursday if invalid day provided
-
-        # Get current date and time in the specified timezone
-        tz = pytz.timezone(timezone)
-        record_datetime = tz.localize(datetime.combine(record_date, time(15, 15, 0)))
-
-        # Get the expiry date of the current month
-        record_expiry = self._get_last_trading_day(
-            record_datetime.year, record_datetime.month, expiry_weekday
+        for expiry_str in ["CURRENT", "MID", "FAR"]:
+            contract_date = self._get_monthly_expiry_date(
+                exchange=fno_exchange,
+                segment=segment,
+                name=fno_name,
+                expiry=expiry_str,
+                relative_date=relative_date,
+            )
+            if contract_date:
+                contract_name = (
+                    f'{spot_name}{contract_date.strftime("%y%b")}FUT'.upper()
+                )
+                contract_names.append(contract_name)
+        logger.info(
+            f"tt::_get_next_three_active_contracts:: returning next three contracts viz. {contract_names}"
         )
 
-        # If current date is past the current month's expiry, get next month's expiry
-        if record_datetime.date() > record_expiry:
-            if record_datetime.month == 12:
-                next_expiry = self._get_last_trading_day(
-                    record_datetime.year + 1, 1, expiry_weekday
-                )
-            else:
-                next_expiry = self._get_last_trading_day(
-                    record_datetime.year, record_datetime.month + 1, expiry_weekday
-                )
-        else:
-            next_expiry = record_expiry
-
-        # Create a datetime object for the expiry at 15:30:00
-        expiry_datetime = tz.localize(datetime.combine(next_expiry, time(15, 30, 0)))
-
-        # Calculate the time difference
-        time_difference = expiry_datetime - record_datetime
-
-        # Convert the time difference to days (float)
-        days_to_expiry = time_difference.total_seconds() / (24 * 3600)
-
-        return days_to_expiry
+        return contract_names
 
     def _get_details_by_symbol(
         self,
         tradingsymbol: str,
         exchange: str,
-        return_db_details: bool,
         fetch_futures: bool,
     ) -> Dict[str, Any]:
         """
@@ -212,32 +229,28 @@ class TickerTape:
                 result_dict = {
                     column.name: getattr(result, column.name)
                     for column in Instruments.__table__.columns
-                    if return_db_details or column.name not in exclude_keys
+                    if column.name not in exclude_keys
                 }
                 for key, value in result_dict.items():
                     if isinstance(value, Decimal):
                         result_dict[key] = float(value)
 
                 if fetch_futures:
-                    mapped_symbol, expiry_day = self.MAPPING_INDICES_TO_FO_SYMBOLS.get(
-                        (tradingsymbol, exchange), (tradingsymbol, "Thursday")
-                    )
+                    fno_name = self.MAPPING_INDICES_TO_FNO_NAMES.get(
+                        tradingsymbol, tradingsymbol
+                    )  # For futures contracts the tradingsymbol is the name of the underlying of the contract.
                     futures_contract_names = self._get_next_three_active_contracts(
-                        spot_name=self._extract_spot_name(mapped_symbol),
-                        expiry_day=expiry_day,
-                        timezone=self.config["timezone"],
+                        exchange=exchange,
+                        fno_name=fno_name,
+                        spot_name=self._extract_spot_name(fno_name),
                     )
 
                     futures_contracts = []
                     for future_symbol in futures_contract_names:
-                        mapped_exchange = self.MAPPING_EQUITY_TO_FO_EXCHANGE.get(
+                        fno_exchange = self.MAPPING_EQUITY_TO_FNO_EXCHANGE.get(
                             exchange, exchange
                         )
-                        future_details = self.get_details(
-                            future_symbol,
-                            mapped_exchange,
-                            return_db_details,
-                        )
+                        future_details = self.get_details(future_symbol, fno_exchange)
                         if future_details:
                             futures_contracts.append(future_details)
                     result_dict["futures_contracts"] = futures_contracts
@@ -246,13 +259,11 @@ class TickerTape:
 
         except SQLAlchemyError as e:
             logger.info(
-                f"tt:_get_details_by_symbol: An error occurred while fetching instrument details: {str(e)}"
+                f"tt::_get_details_by_symbol: An error occurred while fetching instrument details: {str(e)}"
             )
             return {}  # Return an empty dict in case of any exception
 
-    def _get_details_by_token(
-        self, instrument_token: int, return_db_details: bool
-    ) -> Dict[str, Any]:
+    def _get_details_by_token(self, instrument_token: int) -> Dict[str, Any]:
         """
         Retrieves instrument details from the database based on the instrument token.
 
@@ -275,7 +286,7 @@ class TickerTape:
                 exchange = result.exchange
                 if exchange not in self.SUPPORTED_EXCHANGES:
                     raise InvalidExchangeException(
-                        f"tt:_get_details_by_token: invalid exchange {exchange}, supported types are {self.SUPPORTED_EXCHANGES}"
+                        f"tt::_get_details_by_token: invalid exchange {exchange}, supported types are {self.SUPPORTED_EXCHANGES}"
                     )
 
                 # Determine whether to fetch futures based on the tradingsymbol
@@ -283,11 +294,11 @@ class TickerTape:
 
                 # Use _get_details_by_symbol to get all details including futures
                 return self._get_details_by_symbol(
-                    tradingsymbol, exchange, return_db_details, fetch_futures
+                    tradingsymbol, exchange, fetch_futures
                 )
         except SQLAlchemyError as e:
             logger.info(
-                f"tt:_get_details_by_token: An error occurred while fetching instrument details: {str(e)}"
+                f"tt::_get_details_by_token: An error occurred while fetching instrument details: {str(e)}"
             )
             return {}  # Return an empty dict in case of any exception
 
@@ -296,7 +307,6 @@ class TickerTape:
         tradingsymbol: Optional[str] = None,
         exchange: Optional[str] = None,
         instrument_token: Optional[int] = None,
-        return_db_details: bool = False,
     ) -> Dict[str, Any]:
         """
         Get details of an instrument from the database based on either (tradingsymbol and exchange) or (instrument token).
@@ -304,53 +314,62 @@ class TickerTape:
         :param tradingsymbol: The trading symbol of the instrument.
         :param exchange: The exchange where the instrument is traded.
         :param instrument_token: The unique token identifying the instrument.
-        :param return_db_details: Whether to return additional database details.
         :return: A dictionary containing the instrument details.
         """
         if tradingsymbol is not None and exchange is not None:
             if exchange not in self.SUPPORTED_EXCHANGES:
                 raise InvalidExchangeException(
-                    f"tt:get_details: invalid exchange {exchange}, supported types are {self.SUPPORTED_EXCHANGES}"
+                    f"tt::get_details: invalid exchange {exchange}, supported types are {self.SUPPORTED_EXCHANGES}"
                 )
             fetch_futures = not tradingsymbol.endswith("FUT")
-            return self._get_details_by_symbol(
-                tradingsymbol, exchange, return_db_details, fetch_futures
-            )
+            return self._get_details_by_symbol(tradingsymbol, exchange, fetch_futures)
         elif instrument_token is not None:
-            return self._get_details_by_token(instrument_token, return_db_details)
+            return self._get_details_by_token(instrument_token)
         else:
             raise ValueError(
-                "tt:get_details: invalid parameters! please provide either (tradingsymbol, exchange) or instrument_token"
+                "tt::get_details: invalid parameters! please provide either (tradingsymbol, exchange) or instrument_token"
             )
 
-    @staticmethod
-    def _check_supported_category(session: Session, tradingsymbol: str, exchange: str):
-        instrument = session.execute(
-            select(Instruments).where(
-                (Instruments.tradingsymbol == tradingsymbol)
-                & (Instruments.exchange == exchange)
-            )
-        ).scalar_one_or_none()
+    def _get_dte(
+        self, exchange: str, segment: str, name: str, relative_date: date, timezone: str
+    ) -> float:
+        """
+        Calculate the number of days to expiry for the current active contract.
+        """
+        # Get current date and time in the specified timezone
+        tz = pytz.timezone(timezone)
+        record_datetime = tz.localize(datetime.combine(relative_date, time(15, 15, 0)))
 
-        if not instrument:
-            raise ValueError(
-                f"tt:_check_supported_category: instrument not found for {tradingsymbol} on {exchange}"
-            )
+        # Get the expiry date of the current month
+        relative_exp_date = self._get_monthly_expiry_date(
+            exchange, segment, name, expiry="CURRENT", relative_date=relative_date
+        )
+        # Create a datetime object for the expiry at 15:30:00
+        relative_exp_datetime = tz.localize(
+            datetime.combine(relative_exp_date, time(15, 30, 0))
+        )
 
-        segment = instrument.segment
-        instrument_type = instrument.instrument_type
-        if not (exchange == "NSE" and segment == "NSE" and instrument_type == "EQ"):
-            raise InvalidInstrumentCategoryException(
-                f"tt:_check_supported_category: invalid category: {exchange}|{segment}|{instrument_type}"
-            )
+        # Calculate the time difference
+        time_difference = relative_exp_datetime - record_datetime
+
+        # Convert the time difference to days (float)
+        dte = time_difference.total_seconds() / (24 * 3600)
+
+        return dte
 
     @staticmethod
     def _get_historical_data(
-        session: Session, instrument_token: int, interval: str
+        session: Session,
+        exchange: str,
+        segment: str,
+        name: str,
+        instrument_type: str,
+        expiry: str,
+        interval: str,
     ) -> pd.DataFrame:
+
+        attr_str = f"{exchange}|{segment}|{name}|{instrument_type}|{expiry}|{interval}"
         query = select(
-            HistoricalData.instrument_token,
-            HistoricalData.tradingsymbol,
             HistoricalData.exchange,
             HistoricalData.record_date,
             HistoricalData.record_datetime,
@@ -362,7 +381,11 @@ class TickerTape:
             HistoricalData.volume,
             HistoricalData.oi,
         ).where(
-            (HistoricalData.instrument_token == instrument_token)
+            (HistoricalData.exchange == exchange)
+            & (HistoricalData.segment == segment)
+            & (HistoricalData.name == name)
+            & (HistoricalData.instrument_type == instrument_type)
+            & (HistoricalData.expiry == expiry)
             & (HistoricalData.interval == interval)
             & (HistoricalData.status == 1)
         )
@@ -379,9 +402,7 @@ class TickerTape:
         df = pd.DataFrame(data)
 
         if df.empty:
-            logger.warning(
-                f"tt:_get_historical_data: no data found for instrument_token {instrument_token} with interval {interval}"
-            )
+            logger.warning(f"tt::_get_historical_data: no data found for {attr_str}")
             return df
 
         # Convert price columns to float
@@ -410,14 +431,20 @@ class TickerTape:
         ).scalar_one_or_none()
 
         if not vix_instrument:
-            logger.warning("tt:_get_vix_data: india vix instrument not found")
+            logger.warning("tt::_get_vix_data:: india vix instrument not found")
             return pd.DataFrame()
 
         logger.info(
-            f"tt:_get_vix_data: querying for vix data of INDIA VIX@NSE with interval {interval}"
+            f"tt::_get_vix_data:: querying for vix data of INDIA VIX@NSE with interval {interval}"
         )
         df = self._get_historical_data(
-            session, vix_instrument.instrument_token, interval
+            session,
+            exchange=vix_instrument.exchange,
+            segment=vix_instrument.segment,
+            name=vix_instrument.name,
+            instrument_type=vix_instrument.instrument_type,
+            expiry="NONE",
+            interval=interval,
         )
 
         if df.empty:
@@ -435,7 +462,7 @@ class TickerTape:
         # Ensure index is unique
         if df.index.duplicated().any():
             logger.warning(
-                "tt:_get_vix_data: duplicate index values found. keeping last occurrence."
+                "tt::_get_vix_data:: duplicate index values found. keeping last occurrence."
             )
             df = df[~df.index.duplicated(keep="last")]
 
@@ -444,64 +471,66 @@ class TickerTape:
     def _get_futures_data(
         self,
         session: Session,
-        tradingsymbol: str,
-        exchange: str,
+        instrument_details: Dict[str, Any],
         interval: str,
     ) -> pd.DataFrame:
-        mapped_symbol, expiry_day = self.MAPPING_INDICES_TO_FO_SYMBOLS.get(
-            (tradingsymbol, exchange), (tradingsymbol, "Thursday")
-        )
-        future_symbols = self._get_next_three_active_contracts(
-            spot_name=self._extract_spot_name(mapped_symbol),
-            expiry_day=expiry_day,
-            timezone=self.config["timezone"],
-        )
+
+        tradingsymbol = instrument_details["tradingsymbol"]
+        exchange = instrument_details["exchange"]
+        futures_contracts: List[Dict[str, Any]] = instrument_details[
+            "futures_contracts"
+        ]
+        expiry_notation = ["CURRENT", "MID", "FAR"]
 
         dfs = []
-        for i, future_symbol in enumerate(future_symbols):
-            mapped_exchange = self.MAPPING_EQUITY_TO_FO_EXCHANGE.get(exchange, exchange)
-            future_instrument = session.execute(
-                select(Instruments).where(
-                    (Instruments.tradingsymbol == future_symbol)
-                    & (Instruments.exchange == mapped_exchange)
-                )
-            ).scalar_one_or_none()
+        for i, futures_contract in enumerate(futures_contracts):
 
-            if future_instrument:
-                logger.info(
-                    f"tt:_get_futures_data: querying for futures data of {future_symbol}@{mapped_exchange} with interval {interval}"
-                )
-                df = self._get_historical_data(
-                    session, future_instrument.instrument_token, interval
-                )
+            fut_tradingsymbol = futures_contract["tradingsymbol"]
+            fut_exchange = futures_contract["exchange"]
+            fut_segment = futures_contract["segment"]
+            fut_instrument_name = futures_contract["name"]
+            fut_instrument_type = futures_contract["instrument_type"]
 
-                if df.empty:
-                    continue
+            logger.info(
+                f"tt::_get_futures_data:: querying for futures data of {fut_tradingsymbol}@{fut_exchange} with interval {interval}"
+            )
+            df = self._get_historical_data(
+                session,
+                exchange=fut_exchange,
+                segment=fut_segment,
+                name=fut_instrument_name,
+                instrument_type=fut_instrument_type,
+                expiry=expiry_notation[i],
+                interval=interval,
+            )
 
-                if i == 0:
-                    df = df[
-                        [
-                            "open_price",
-                            "high_price",
-                            "low_price",
-                            "close_price",
-                            "volume",
-                            "oi",
-                        ]
+            if df.empty:
+                continue
+
+            if i == 0:
+                df = df[
+                    [
+                        "open_price",
+                        "high_price",
+                        "low_price",
+                        "close_price",
+                        "volume",
+                        "oi",
                     ]
-                elif i == 1:
-                    df = df[["close_price", "oi"]].rename(
-                        columns={"oi": "oi_mid", "close_price": "close_price_mid"}
-                    )
-                elif i == 2:
-                    df = df[["close_price"]].rename(
-                        columns={"close_price": "close_price_far"}
-                    )
-                dfs.append(df)
+                ]
+            elif i == 1:
+                df = df[["close_price", "oi"]].rename(
+                    columns={"oi": "oi_mid", "close_price": "close_price_mid"}
+                )
+            elif i == 2:
+                df = df[["close_price"]].rename(
+                    columns={"close_price": "close_price_far"}
+                )
+            dfs.append(df)
 
         if not dfs:
             logger.warning(
-                f"tt:_get_futures_data: no futures data found for {tradingsymbol} on {exchange}"
+                f"tt::_get_futures_data:: no futures data found for {tradingsymbol} on {exchange}"
             )
             return pd.DataFrame()
 
@@ -510,7 +539,7 @@ class TickerTape:
         # Ensure index is unique
         if combined_df.index.duplicated().any():
             logger.warning(
-                "tt:_get_futures_data: duplicate index values found. keeping last occurrence."
+                "tt::_get_futures_data:: duplicate index values found. keeping last occurrence."
             )
             combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
 
@@ -530,31 +559,45 @@ class TickerTape:
             "close_price_far": "fut_close_far",
         }
         renamed_df = combined_df.rename(columns=fut_columns)[list(fut_columns.values())]
-        renamed_df["fut_dte"] = renamed_df.index.map(
-            lambda date_: self._get_dte(date_, expiry_day, self.config["timezone"])
-        )
+
+        if futures_contracts:
+            renamed_df["fut_dte"] = renamed_df.index.map(
+                lambda date_: self._get_dte(
+                    exchange=futures_contracts[0]["exchange"],
+                    segment=futures_contracts[0]["segment"],
+                    name=futures_contracts[0]["name"],
+                    relative_date=date_,
+                    timezone=self.config["timezone"],
+                )
+            )
+        else:
+            renamed_df["fut_dte"] = np.nan
+
         return renamed_df
 
     def _get_spot_data(
-        self, session: Session, tradingsymbol: str, exchange: str, interval: str
+        self, session: Session, instrument_details: Dict[str, Any], interval: str
     ) -> pd.DataFrame:
+
+        tradingsymbol = instrument_details["tradingsymbol"]
+        exchange = instrument_details["exchange"]
+        segment = instrument_details["segment"]
+        instrument_name = instrument_details["name"]
+        instrument_type = instrument_details["instrument_type"]
+
         logger.info(
-            f"tt:_get_spot_data: querying for equity data of {tradingsymbol}@{exchange} with interval {interval}"
+            f"tt::_get_spot_data:: querying for equity data of {tradingsymbol}@{exchange} with interval {interval}"
         )
-        instrument = session.execute(
-            select(Instruments).where(
-                (Instruments.tradingsymbol == tradingsymbol)
-                & (Instruments.exchange == exchange)
-            )
-        ).scalar_one_or_none()
 
-        if not instrument:
-            logger.warning(
-                f"tt:_get_spot_data: equity instrument not found for {tradingsymbol} on {exchange}"
-            )
-            return pd.DataFrame()
-
-        df = self._get_historical_data(session, instrument.instrument_token, interval)
+        df = self._get_historical_data(
+            session,
+            exchange=exchange,
+            segment=segment,
+            name=instrument_name,
+            instrument_type=instrument_type,
+            expiry="NONE",
+            interval=interval,
+        )
 
         if df.empty:
             return df
@@ -572,7 +615,7 @@ class TickerTape:
         # Ensure index is unique
         if df.index.duplicated().any():
             logger.warning(
-                "tt:_get_spot_data: duplicate index values found. keeping last occurrence."
+                "tt::_get_spot_data:: duplicate index values found. keeping last occurrence."
             )
             df = df[~df.index.duplicated(keep="last")]
 
@@ -612,61 +655,65 @@ class TickerTape:
         df["spot_volume"] = df["spot_volume"] * df["fut_estimated_split"]
         return df
 
-    def _get_data_for_x_by_symbol(
+    def _get_data_by_symbol(
         self, tradingsymbol: str, exchange: str, interval: str
     ) -> pd.DataFrame:
         try:
-            with self._session_scope() as session:
-                self._check_supported_category(session, tradingsymbol, exchange)
+            equity_details = self.get_details(tradingsymbol, exchange)
+            index_details = self.get_details("NIFTY 50", "NSE")
+            if equity_details:
+                with self._session_scope() as session:
 
-                spot_data_df = self._get_spot_data(
-                    session, tradingsymbol, exchange, interval
-                )
-                index_spot_df = self._get_spot_data(
-                    session, "NIFTY 50", "NSE", interval
-                )
-                index_spot_df.columns = index_spot_df.columns.str.replace(
-                    "^spot_", "index_spot_", regex=True
-                )
-                fut_data_df = self._get_futures_data(
-                    session,
-                    tradingsymbol,
-                    exchange,
-                    interval,
-                )
-                index_fut_data_df = self._get_futures_data(
-                    session,
-                    "NIFTY 50",
-                    "NSE",
-                    interval,
-                )
-                index_fut_data_df.columns = index_fut_data_df.columns.str.replace(
-                    "^fut_", "index_", regex=True
-                )
-                vix_data_df = self._get_vix_data(session, interval)
-                complete_df = pd.concat(
-                    [
-                        spot_data_df,
-                        index_spot_df,
-                        fut_data_df,
-                        index_fut_data_df,
-                        vix_data_df,
-                    ],
-                    axis=1,
-                    verify_integrity=True,
-                )
-                complete_df = self._adjust_data_for_splits(complete_df)
-                return complete_df
+                    spot_data_df = self._get_spot_data(
+                        session, equity_details, interval
+                    )
 
+                    index_spot_df = self._get_spot_data(
+                        session, index_details, interval
+                    )
+                    if index_spot_df.columns:
+                        index_spot_df.columns = index_spot_df.columns.str.replace(
+                            "^spot_", "index_spot_", regex=True
+                        )
+
+                    fut_data_df = self._get_futures_data(
+                        session,
+                        equity_details,
+                        interval,
+                    )
+                    index_fut_data_df = self._get_futures_data(
+                        session,
+                        index_details,
+                        interval,
+                    )
+                    index_fut_data_df.columns = index_fut_data_df.columns.str.replace(
+                        "^fut_", "index_", regex=True
+                    )
+                    vix_data_df = self._get_vix_data(session, interval)
+                    complete_df = pd.concat(
+                        [
+                            spot_data_df,
+                            index_spot_df,
+                            fut_data_df,
+                            index_fut_data_df,
+                            vix_data_df,
+                        ],
+                        axis=1,
+                        verify_integrity=True,
+                    )
+                    complete_df = self._adjust_data_for_splits(complete_df)
+                    return complete_df
+            else:
+                logger.warning(
+                    f"tt::_get_data_by_symbol:: equity instrument not found for {tradingsymbol} on {exchange}"
+                )
         except SQLAlchemyError as e:
             logger.error(
-                f"tt:_get_data_for_x_by_symbol:an error occurred in sqlalchemy operations: {str(e)}"
+                f"tt::_get_data_for_x_by_symbol:: an error occurred in sqlalchemy operations: {str(e)}"
             )
             return pd.DataFrame()
 
-    def _get_data_for_x_by_token(
-        self, instrument_token: int, interval: str
-    ) -> pd.DataFrame:
+    def _get_data_by_token(self, instrument_token: int, interval: str) -> pd.DataFrame:
         try:
             with self._session_scope() as session:
                 # Query the Instruments table by instrument_token
@@ -683,14 +730,14 @@ class TickerTape:
                 exchange = result.exchange
                 if exchange not in self.SUPPORTED_EXCHANGES:
                     raise InvalidExchangeException(
-                        f"tt:_get_data_for_x_by_token: invalid exchange {exchange}, supported types are {self.SUPPORTED_EXCHANGES}"
+                        f"tt::_get_data_for_x_by_token:: invalid exchange {exchange}, supported types are {self.SUPPORTED_EXCHANGES}"
                     )
 
                 # Use _get_data_for_x_by_symbol to get all data
-                return self._get_data_for_x_by_symbol(tradingsymbol, exchange, interval)
+                return self._get_data_by_symbol(tradingsymbol, exchange, interval)
         except SQLAlchemyError as e:
             logger.info(
-                f"tt:_get_data_for_x_by_token: an error occurred while fetching data for x: {str(e)}"
+                f"tt::_get_data_for_x_by_token:: an error occurred while fetching data for x: {str(e)}"
             )
             return (
                 pd.DataFrame()
@@ -706,8 +753,8 @@ class TickerTape:
                 try:
                     df[column] = df[column].astype(dtype_mapping[current_dtype])
                 except ValueError as e:
-                    print(
-                        f"Warning: Could not convert column {column} to {dtype_mapping[current_dtype]}. Error: {e}"
+                    logger.warning(
+                        f"tt::_standardize_dtypes:: could not convert column {column} to {dtype_mapping[current_dtype]}. Error: {e}"
                     )
                     # If conversion fails, we might want to handle NaN values
                     if pd.api.types.is_float_dtype(df[column]):
@@ -726,7 +773,7 @@ class TickerTape:
 
         return df
 
-    def get_data_for_x(
+    def get_data(
         self,
         tradingsymbol: Optional[str] = None,
         exchange: Optional[str] = None,
@@ -734,7 +781,7 @@ class TickerTape:
         interval: str = "day",
     ) -> pd.DataFrame:
         """
-        Returns combined pd.DataFrame of equity and/or indices, with futures and vix with date index
+        Returns combined `OHLCV + OI` pd.DataFrame of equity, index, futures and vix data with date index
 
         :param tradingsymbol: The trading symbol of the instrument.
         :param exchange: The exchange where the instrument is traded.
@@ -746,14 +793,14 @@ class TickerTape:
             if tradingsymbol and exchange:
                 if exchange not in self.SUPPORTED_EXCHANGES:
                     raise InvalidExchangeException(
-                        f"tt:get_data_for_x: Invalid exchange {exchange}"
+                        f"tt::get_data:: Invalid exchange {exchange}"
                     )
-                df = self._get_data_for_x_by_symbol(tradingsymbol, exchange, interval)
+                df = self._get_data_by_symbol(tradingsymbol, exchange, interval)
             elif instrument_token:
-                df = self._get_data_for_x_by_token(instrument_token, interval)
+                df = self._get_data_by_token(instrument_token, interval)
             else:
                 raise ValueError(
-                    "tt:get_data_for_x: invalid parameters! provide either (tradingsymbol, exchange) or instrument_token"
+                    "tt::get_data:: invalid parameters! provide either (tradingsymbol, exchange) or instrument_token"
                 )
 
             df.index = pd.to_datetime(df.index)
@@ -771,5 +818,5 @@ class TickerTape:
             df = self._standardize_dtypes(df)
             return df
         except Exception as e:
-            logger.error(f"tt:get_data_for_x: an error occurred: {str(e)}")
+            logger.error(f"tt::get_data:: an error occurred: {str(e)}")
             return pd.DataFrame()
