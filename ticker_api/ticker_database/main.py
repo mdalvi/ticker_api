@@ -156,7 +156,6 @@ class TickerDatabase:
                 stmt = insert(FNOExpiryDates).values(data_to_insert)
                 stmt = stmt.on_duplicate_key_update(
                     {
-                        "expiry_weekday": stmt.inserted.expiry_weekday,
                         "status": 1,
                         "updated_at": sql_func.now(),  # Set the current timestamp
                     }
@@ -238,7 +237,6 @@ class TickerDatabase:
                 # Perform upsert operation
                 insert_stmt = insert(FNOExpiryDates).values(expiry_dates)
                 upsert_stmt = insert_stmt.on_duplicate_key_update(
-                    expiry_weekday=insert_stmt.inserted.expiry_weekday,
                     status=insert_stmt.inserted.status,
                     updated_at=datetime.now(),
                 )
