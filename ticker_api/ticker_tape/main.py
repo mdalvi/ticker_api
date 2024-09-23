@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, time
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
-
+import traceback
 import numpy as np
 import pandas as pd
 import pytz
@@ -623,36 +623,44 @@ class TickerTape:
 
     @staticmethod
     def _adjust_data_for_splits(df: pd.DataFrame) -> pd.DataFrame:
-        # Calculate the ratio between futures and spot prices
-        df["fut_price_ratio"] = df["fut_close"] / df["spot_close"]
 
-        def to_nearest_x1_multiple(value: float) -> float:
-            # Check if the value is np.nan or pd.NA
-            if pd.isna(value):
-                return np.nan
+        if "fut_close" in df.columns:
+            # Calculate the ratio between futures and spot prices
+            df["fut_price_ratio"] = df["fut_close"] / df["spot_close"]
 
-            # Get the order of magnitude of the value
-            order = math.floor(math.log10(abs(value)))
+            def to_nearest_x1_multiple(value: float) -> float:
+                # Check if the value is np.nan or pd.NA
+                if pd.isna(value):
+                    return np.nan
 
-            # Calculate the x1 multiple for this order of magnitude
-            x1_multiple = 10**order
+                # Get the order of magnitude of the value
+                order = math.floor(math.log10(abs(value)))
 
-            # Round to the nearest x1 multiple
-            return round(value / x1_multiple) * x1_multiple
+                # Calculate the x1 multiple for this order of magnitude
+                x1_multiple = 10**order
 
-        # Apply the split ratio estimation
-        df["fut_estimated_split"] = df["fut_price_ratio"].apply(to_nearest_x1_multiple)
+                # Round to the nearest x1 multiple
+                return round(value / x1_multiple) * x1_multiple
 
-        # Adjust the futures price
-        df["fut_open"] = df["fut_open"] / df["fut_estimated_split"]
-        df["fut_high"] = df["fut_high"] / df["fut_estimated_split"]
-        df["fut_low"] = df["fut_low"] / df["fut_estimated_split"]
-        df["fut_close"] = df["fut_close"] / df["fut_estimated_split"]
-        df["fut_close_mid"] = df["fut_close_mid"] / df["fut_estimated_split"]
-        df["fut_close_far"] = df["fut_close_far"] / df["fut_estimated_split"]
-        df["fut_volume"] = df["fut_volume"] * df["fut_estimated_split"]
-        df["fut_oi"] = df["fut_oi"] * df["fut_estimated_split"]
-        df["spot_volume"] = df["spot_volume"] * df["fut_estimated_split"]
+            # Apply the split ratio estimation
+            df["fut_estimated_split"] = df["fut_price_ratio"].apply(
+                to_nearest_x1_multiple
+            )
+
+            # Adjust the futures price
+            df["fut_open"] = df["fut_open"] / df["fut_estimated_split"]
+            df["fut_high"] = df["fut_high"] / df["fut_estimated_split"]
+            df["fut_low"] = df["fut_low"] / df["fut_estimated_split"]
+            df["fut_close"] = df["fut_close"] / df["fut_estimated_split"]
+            df["fut_close_mid"] = df["fut_close_mid"] / df["fut_estimated_split"]
+            df["fut_close_far"] = df["fut_close_far"] / df["fut_estimated_split"]
+            df["fut_volume"] = df["fut_volume"] * df["fut_estimated_split"]
+            df["fut_oi"] = df["fut_oi"] * df["fut_estimated_split"]
+            df["spot_volume"] = df["spot_volume"] * df["fut_estimated_split"]
+        else:
+            logger.warning(
+                f"tt::_adjust_data_for_splits:: futures data is not available! prices/volume may be exposed to split issues"
+            )
         return df
 
     def _get_data_by_symbol(
@@ -671,10 +679,10 @@ class TickerTape:
                     index_spot_df = self._get_spot_data(
                         session, index_details, interval
                     )
-                    if index_spot_df.columns:
-                        index_spot_df.columns = index_spot_df.columns.str.replace(
-                            "^spot_", "index_spot_", regex=True
-                        )
+
+                    index_spot_df.columns = index_spot_df.columns.str.replace(
+                        "^spot_", "index_spot_", regex=True
+                    )
 
                     fut_data_df = self._get_futures_data(
                         session,
@@ -702,6 +710,7 @@ class TickerTape:
                         verify_integrity=True,
                     )
                     complete_df = self._adjust_data_for_splits(complete_df)
+                    complete_df["tradingsymbol"] = tradingsymbol
                     return complete_df
             else:
                 logger.warning(
@@ -803,20 +812,35 @@ class TickerTape:
                     "tt::get_data:: invalid parameters! provide either (tradingsymbol, exchange) or instrument_token"
                 )
 
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
+            if df is None:
+                logger.warning(
+                    f"tt::get_data:: no data found for requested ticker in database"
+                )
+            else:
+                df.index = pd.to_datetime(df.index)
+                df = df.sort_index()
 
-            df["fut_oi"] = df["fut_oi"].replace(0.0, np.nan).ffill().fillna(0)
-            df["index_oi"] = df["index_oi"].replace(0.0, np.nan).ffill().fillna(0)
-            df["spot_volume"] = df["spot_volume"].replace(0.0, np.nan).ffill().fillna(0)
-            df["fut_volume"] = df["fut_volume"].replace(0.0, np.nan).ffill().fillna(0)
-            df["index_volume"] = (
-                df["index_volume"].replace(0.0, np.nan).ffill().fillna(0)
-            )
-            df = df.drop(["index_spot_volume"], axis=1)
+                df["spot_volume"] = (
+                    df["spot_volume"].replace(0.0, np.nan).ffill().fillna(0)
+                )
 
-            df = self._standardize_dtypes(df)
+                if "fut_oi" in df.columns:
+                    df["fut_oi"] = df["fut_oi"].replace(0.0, np.nan).ffill().fillna(0)
+
+                if "fut_volume" in df.columns:
+                    df["fut_volume"] = (
+                        df["fut_volume"].replace(0.0, np.nan).ffill().fillna(0)
+                    )
+
+                df["index_oi"] = df["index_oi"].replace(0.0, np.nan).ffill().fillna(0)
+                df["index_volume"] = (
+                    df["index_volume"].replace(0.0, np.nan).ffill().fillna(0)
+                )
+                df = df.drop(["index_spot_volume"], axis=1)
+
+                df = self._standardize_dtypes(df)
             return df
         except Exception as e:
             logger.error(f"tt::get_data:: an error occurred: {str(e)}")
+            logger.error(f"tt::get_data:: traceback: \n{traceback.format_exc()}")
             return pd.DataFrame()
