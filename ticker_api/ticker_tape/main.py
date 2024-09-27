@@ -359,7 +359,7 @@ class TickerTape:
         return dte
 
     @staticmethod
-    def _keep_highest_volume_for_duplicates(df):
+    def _keep_highest_volume_for_duplicates(df: pd.DataFrame) -> pd.DataFrame:
         # Identify duplicates
         duplicates = df.index.duplicated(keep=False)
 
