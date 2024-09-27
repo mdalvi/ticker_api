@@ -45,7 +45,7 @@ def main():
     ticker_tape = TickerTape()
 
     # Sync all existing historical data in database
-    ticker_tape.get_data(tradingsymbol="ADANIPORTS", exchange="NSE")
+    ticker_tape.get_data(tradingsymbol="ASIANPAINT", exchange="NSE")
 
     print("Get data operation completed!")
 

@@ -1,17 +1,17 @@
 import math
 import re
+import traceback
 from contextlib import contextmanager
 from datetime import datetime, date, time
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
-import traceback
+
 import numpy as np
 import pandas as pd
 import pytz
 from sqlalchemy import select, create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker, Session
-
 from ticker_api.exceptions import (
     InvalidExchangeException,
 )
@@ -25,6 +25,7 @@ from ticker_api.ticker_database.schema import (
 logger = get_logger()
 
 
+# noinspection PyTypeChecker
 class TickerTape:
     SUPPORTED_EXCHANGES = {"NSE", "NFO"}
     MAPPING_INDICES_TO_FNO_NAMES = {
@@ -358,6 +359,23 @@ class TickerTape:
         return dte
 
     @staticmethod
+    def _keep_highest_volume_for_duplicates(df):
+        # Identify duplicates
+        duplicates = df.index.duplicated(keep=False)
+
+        if not duplicates.any():
+            return df  # No duplicates found, return original DataFrame
+
+        # Sort the DataFrame by index and volume (descending)
+        df_sorted = df.sort_values(["volume"], ascending=[False])
+
+        # Keep the first occurrence (highest volume) for each date
+        df_cleaned = df_sorted[~df_sorted.index.duplicated(keep="first")]
+
+        # Sort by index to maintain original order
+        return df_cleaned.sort_index()
+
+    @staticmethod
     def _get_historical_data(
         session: Session,
         exchange: str,
@@ -526,6 +544,7 @@ class TickerTape:
                 df = df[["close_price"]].rename(
                     columns={"close_price": "close_price_far"}
                 )
+            df = self._keep_highest_volume_for_duplicates(df)
             dfs.append(df)
 
         if not dfs:

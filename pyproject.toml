@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ticker-api"
-version = "0.2.6"
+version = "0.2.7"
 description = ""
 authors = ["mdalvi <milind.dalvi@protonmail.com>"]
 license = "MIT"
@@ -17,6 +17,7 @@ pandas = "^2.2.2"
 zerodha-api = {path = "../zerodha_api"}
 sqlalchemy = "^2.0.32"
 pymysql = "^1.1.1"
+openpyxl = "^3.1.5"
 
 [tool.poetry.dev-dependencies]
 pytest = "^8.3.2"
